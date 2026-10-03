@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=USB Tracker
+Comment=Watch USB topology, power budgets, drops and reconnects
+Exec=sh -c 'cd %k/..; exec python3 -m usbtracker'
+Icon=drive-removable-media-usb
+Terminal=false
+Categories=System;Monitor;
