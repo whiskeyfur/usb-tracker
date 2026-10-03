@@ -40,6 +40,12 @@ class Node:
     subtree_ma: float = 0.0
     status: str = ""
     urb_rate: float = 0.0
+    rx_bps: float = 0.0
+    tx_bps: float = 0.0
+    alloc_bps: float = 0.0
+    sub_bps: float = 0.0
+    link_bps: float = 0.0
+    counter_source: str = ""
     first_seen: float = 0.0
     last_seen: float = 0.0
     connects: int = 0
@@ -56,6 +62,15 @@ class Node:
     def lost(self) -> bool:
         return not self.present
 
+    @property
+    def total_bps(self) -> float:
+        return self.rx_bps + self.tx_bps
+
+    @property
+    def measured(self) -> bool:
+        """True when the kernel counts this device's bytes for real."""
+        return bool(self.counter_source)
+
 
 @dataclass
 class Snapshot:
@@ -63,6 +78,8 @@ class Snapshot:
     nodes: dict[str, Node] = field(default_factory=dict)
     roots: list[str] = field(default_factory=list)
     total_ma: float = 0.0
+    total_bps: float = 0.0
+    total_alloc_bps: float = 0.0
     live_count: int = 0
     lost_count: int = 0
     interval: float = 2.0
@@ -187,11 +204,20 @@ class Monitor:
         busid_to_key = {d.busid: k for k, d in live.items()}
 
         est: dict[str, float] = {}
+        flow: dict[str, tuple[float, float]] = {}
+        alloc: dict[str, float] = {}
+        urb: dict[str, float] = {}
         for key, dev in live.items():
             prev = self._prev.get(key)
             est[key] = dev.estimate_ma(prev)
+            flow[key] = dev.throughput(prev, dt)
+            alloc[key] = dev.reserved_bps
+            # computed here, while _prev still holds the previous poll
+            urb[key] = dev.urb_rate(prev, dt)
 
         subtree = self._subtree_totals(live, busid_to_key, est)
+        sub_bps = self._subtree_totals(
+            live, busid_to_key, {k: sum(v) for k, v in flow.items()})
 
         # --- appearances and changes
         for key, dev in live.items():
@@ -204,7 +230,8 @@ class Monitor:
                 manufacturer=dev.manufacturer, class_hint=dev.class_hint,
                 speed_mbps=dev.speed_mbps, max_power_ma=dev.max_power_ma,
                 version=dev.version, is_hub=dev.is_hub,
-                self_powered=dev.self_powered, ts=now, present=True)
+                self_powered=dev.self_powered, ts=now, present=True,
+                counter_source=dev.counter_source)
 
             if is_new:
                 st.add_event(now, key, store.KIND_ATTACH,
@@ -234,9 +261,12 @@ class Monitor:
 
         # --- samples
         for key, dev in live.items():
+            rx, tx = flow[key]
             st.add_sample(now, key, est[key], float(dev.max_power_ma),
                           subtree.get(key, est[key]), dev.runtime_status,
-                          dev.urb_rate(self._prev.get(key), dt))
+                          urb[key],
+                          rx_bps=rx, tx_bps=tx, alloc_bps=alloc[key],
+                          sub_bps=sub_bps.get(key, rx + tx))
 
         # --- kernel log extras
         if self.kmsg is not None:
@@ -256,7 +286,8 @@ class Monitor:
         self._prev = live
         self._prev_ts = now
 
-        snap = self._build_snapshot(now, live, busid_to_key, est, subtree)
+        snap = self._build_snapshot(now, live, busid_to_key, est, subtree,
+                                    flow, alloc, sub_bps, urb)
         with self._lock:
             self.snapshot = snap
         if self.on_snapshot is not None:
@@ -291,6 +322,11 @@ class Monitor:
             st.add_event(now, key, store.KIND_OVERCURRENT,
                          f"port over-current count {prev.over_current} -> "
                          f"{dev.over_current}")
+        before, after = prev.reserved_bps, dev.reserved_bps
+        if abs(after - before) > max(64.0, before * 0.02):
+            st.add_event(now, key, store.KIND_BANDWIDTH,
+                         f"reserved bus bandwidth {_bps(before)} -> "
+                         f"{_bps(after)}")
         old_drivers, new_drivers = prev.drivers(), dev.drivers()
         if old_drivers != new_drivers:
             gone = [d for d in old_drivers if d not in new_drivers]
@@ -304,10 +340,10 @@ class Monitor:
 
     def _subtree_totals(self, live: dict[str, UsbDevice],
                         busid_to_key: dict[str, str],
-                        est: dict[str, float]) -> dict[str, float]:
-        """Own draw plus everything downstream, deepest first."""
+                        values: dict[str, float]) -> dict[str, float]:
+        """A device's own value plus everything downstream, deepest first."""
         order = sorted(live, key=lambda k: len(live[k].busid), reverse=True)
-        totals = {k: est.get(k, 0.0) for k in live}
+        totals = {k: values.get(k, 0.0) for k in live}
         for key in order:
             parent_busid = live[key].parent_busid
             pkey = busid_to_key.get(parent_busid or "")
@@ -317,7 +353,11 @@ class Monitor:
 
     def _build_snapshot(self, now: float, live: dict[str, UsbDevice],
                         busid_to_key: dict[str, str], est: dict[str, float],
-                        subtree: dict[str, float]) -> Snapshot:
+                        subtree: dict[str, float],
+                        flow: dict[str, tuple[float, float]],
+                        alloc: dict[str, float],
+                        sub_bps: dict[str, float],
+                        urb: dict[str, float]) -> Snapshot:
         snap = Snapshot(ts=now, interval=self.interval, db_path=self.db_path,
                         paused=self._paused)
         st = self._store
@@ -347,7 +387,13 @@ class Monitor:
                 est_ma=est.get(key, 0.0),
                 subtree_ma=subtree.get(key, 0.0),
                 status=dev.runtime_status if dev else "",
-                urb_rate=dev.urb_rate(self._prev.get(key), self.interval) if dev else 0.0,
+                urb_rate=urb.get(key, 0.0),
+                rx_bps=flow.get(key, (0.0, 0.0))[0],
+                tx_bps=flow.get(key, (0.0, 0.0))[1],
+                alloc_bps=alloc.get(key, 0.0),
+                sub_bps=sub_bps.get(key, 0.0),
+                link_bps=dev.link_bps if dev else 0.0,
+                counter_source=dev.counter_source if dev else row.counter_source,
                 first_seen=row.first_seen, last_seen=row.last_seen,
                 connects=row.connects, disconnects=row.disconnects,
                 resets=kinds.get(store.KIND_RESET, 0),
@@ -381,11 +427,21 @@ class Monitor:
         snap.live_count = sum(1 for n in snap.nodes.values() if n.present)
         snap.lost_count = len(snap.nodes) - snap.live_count
         snap.total_ma = sum(est.get(k, 0.0) for k in live)
+        snap.total_bps = sum(sum(flow.get(k, (0.0, 0.0))) for k in live)
+        snap.total_alloc_bps = sum(alloc.get(k, 0.0) for k in live)
         if self.kmsg is not None:
             snap.kmsg_ok = self.kmsg.available
             snap.kmsg_error = self.kmsg.error
         snap.db_bytes = st.db_size()
         return snap
+
+
+def _bps(value: float) -> str:
+    for unit in ("B/s", "kB/s", "MB/s"):
+        if value < 1024 or unit == "MB/s":
+            return f"{value:.0f} {unit}" if value >= 10 else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB/s"
 
 
 def _dur(seconds: float) -> str:

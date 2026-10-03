@@ -12,15 +12,21 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from usbtracker import store, sysfs                      # noqa: E402
-from usbtracker.app import fmt_ma, nice_ceiling          # noqa: E402
+from usbtracker.app import fmt_bps, fmt_ma, nice_ceiling  # noqa: E402
 from usbtracker.monitor import Monitor                   # noqa: E402
 from usbtracker.store import Store                       # noqa: E402
-from usbtracker.sysfs import UsbDevice                   # noqa: E402
+from usbtracker.sysfs import Endpoint, Interface, UsbDevice   # noqa: E402
+
+
+def endpoint(kind="Interrupt", packet=64, mult=1, interval_us=1000.0,
+             direction="in") -> Endpoint:
+    return Endpoint(name="ep_81", address=0x81, kind=kind, direction=direction,
+                    max_packet=packet, mult=mult, interval_us=interval_us)
 
 
 def device(busid, *, vid="abcd", pid="1234", serial="", power=100,
            status="active", active_ms=0, susp_ms=0, product="Widget",
-           dev_class=0x03) -> UsbDevice:
+           dev_class=0x03, endpoints=(), counters=None) -> UsbDevice:
     dev = UsbDevice(busid=busid)
     dev.is_root_hub = busid.startswith("usb")
     dev.parent_busid = sysfs._parent_busid(busid)
@@ -30,6 +36,12 @@ def device(busid, *, vid="abcd", pid="1234", serial="", power=100,
     dev.max_power_ma = power
     dev.runtime_status = status
     dev.active_time_ms, dev.suspended_time_ms = active_ms, susp_ms
+    if endpoints:
+        dev.interfaces = [Interface(name=f"{busid}:1.0", number=0, cls=dev_class,
+                                    subclass=0, protocol=0, driver="",
+                                    endpoints=list(endpoints))]
+    if counters is not None:
+        dev.counter_source, dev.rx_bytes, dev.tx_bytes = counters
     dev.key = sysfs.identity_key(dev)
     return dev
 
@@ -56,6 +68,56 @@ class PowerEstimateTests(unittest.TestCase):
         before = device("3-1", active_ms=90000, susp_ms=0)
         after = device("3-1", active_ms=120, susp_ms=0)
         self.assertEqual(after.active_fraction(before), 1.0)
+
+
+class BandwidthTests(unittest.TestCase):
+    def test_reserved_bandwidth_from_endpoint_descriptor(self):
+        # 64 bytes every 1 ms is 64 kB/s of reserved bus time
+        dev = device("3-1", endpoints=[endpoint(packet=64, interval_us=1000.0)])
+        self.assertAlmostEqual(dev.reserved_bps, 64000.0)
+
+    def test_high_speed_multiplier_counts(self):
+        dev = device("3-1", endpoints=[endpoint(packet=1024, mult=3,
+                                                interval_us=125.0)])
+        self.assertAlmostEqual(dev.reserved_bps, 1024 * 3 / 125e-6)
+
+    def test_bulk_endpoints_reserve_nothing(self):
+        """Bulk is best-effort: the controller sets no bandwidth aside."""
+        dev = device("3-1", endpoints=[endpoint(kind="Bulk", packet=512,
+                                                interval_us=0.0)])
+        self.assertEqual(dev.reserved_bps, 0.0)
+
+    def test_idle_isochronous_alt_setting_reserves_nothing(self):
+        """A camera that is not streaming sits on a zero-bandwidth setting."""
+        dev = device("3-1", endpoints=[endpoint(kind="Isoc", packet=0,
+                                                interval_us=1000.0)])
+        self.assertEqual(dev.reserved_bps, 0.0)
+
+    def test_interval_parsing(self):
+        self.assertEqual(sysfs._interval_us("125us"), 125.0)
+        self.assertEqual(sysfs._interval_us("10ms"), 10000.0)
+        self.assertEqual(sysfs._interval_us("0ms"), 0.0)
+
+    def test_throughput_from_counter_deltas(self):
+        before = device("3-1", counters=("block:sdb", 1000, 500))
+        after = device("3-1", counters=("block:sdb", 3000, 1500))
+        rx, tx = after.throughput(before, 2.0)
+        self.assertAlmostEqual(rx, 1000.0)
+        self.assertAlmostEqual(tx, 500.0)
+
+    def test_no_counter_means_no_measurement(self):
+        before, after = device("3-1"), device("3-1")
+        self.assertEqual(after.throughput(before, 2.0), (0.0, 0.0))
+
+    def test_counter_reset_is_not_a_spike(self):
+        before = device("3-1", counters=("block:sdb", 9_000_000, 0))
+        after = device("3-1", counters=("block:sdb", 4096, 0))
+        self.assertEqual(after.throughput(before, 2.0), (0.0, 0.0))
+
+    def test_changed_backing_device_is_not_a_spike(self):
+        before = device("3-1", counters=("block:sdb", 9_000_000, 0))
+        after = device("3-1", counters=("block:sdc", 10, 0))
+        self.assertEqual(after.throughput(before, 2.0), (0.0, 0.0))
 
 
 class IdentityTests(unittest.TestCase):
@@ -136,6 +198,34 @@ class TrackingTests(unittest.TestCase):
         self.assertAlmostEqual(snap.nodes[leaf.key].subtree_ma, 500.0)
         self.assertAlmostEqual(snap.nodes[hub.key].subtree_ma, 600.0)
 
+    def test_bandwidth_reservation_change_is_logged(self):
+        """A camera starting to stream shows up as a reservation appearing."""
+        self.world = {"3-1": device("3-1", serial="SN1",
+                                    endpoints=[endpoint(kind="Isoc", packet=0,
+                                                        interval_us=1000.0)])}
+        self.mon.tick()
+        self.world = {"3-1": device("3-1", serial="SN1",
+                                    endpoints=[endpoint(kind="Isoc", packet=3072,
+                                                        mult=2,
+                                                        interval_us=125.0)])}
+        snap = self.mon.tick()
+        self.assertIn(store.KIND_BANDWIDTH, self.kinds("abcd:1234:SN1"))
+        self.assertGreater(snap.nodes["abcd:1234:SN1"].alloc_bps, 1e6)
+
+    def test_subtree_bandwidth_sums_downstream_traffic(self):
+        hub = device("usb3", power=0, product="Root hub", dev_class=0x09)
+        inner = device("3-1", serial="HUB", dev_class=0x09)
+        leaf = device("3-1.1", serial="LEAF", counters=("block:sdb", 0, 0))
+        self.world = {"usb3": hub, "3-1": inner, "3-1.1": leaf}
+        self.mon.tick()
+        self.world["3-1.1"] = device("3-1.1", serial="LEAF",
+                                     counters=("block:sdb", 2048, 1024))
+        snap = self.mon.tick()
+        leaf_node = snap.nodes["abcd:1234:LEAF"]
+        self.assertGreater(leaf_node.total_bps, 0)
+        self.assertAlmostEqual(snap.nodes["abcd:1234:HUB"].sub_bps,
+                               leaf_node.total_bps)
+
     def test_config_and_power_changes_are_logged(self):
         self.world = {"3-1": device("3-1", serial="SN1", power=100)}
         self.mon.tick()
@@ -195,6 +285,15 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(fmt_ma(0), "–")
         self.assertEqual(fmt_ma(2.5), "2.5 mA")
         self.assertEqual(fmt_ma(480), "480 mA")
+
+    def test_byte_rate_formatting(self):
+        self.assertEqual(fmt_bps(0), "–")
+        self.assertEqual(fmt_bps(512), "512 B/s")
+        self.assertEqual(fmt_bps(64000), "62.5 kB/s")
+        self.assertEqual(fmt_bps(12 * 1024 * 1024), "12.0 MB/s")
+        self.assertEqual(fmt_bps(12 * 1024 * 1024, "axis"), "12.0 MB")
+        self.assertEqual(fmt_bps(12 * 1024 * 1024, "compact"), "12.0M")
+        self.assertEqual(fmt_bps(392192, "compact"), "383k")
 
 
 if __name__ == "__main__":

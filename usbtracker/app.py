@@ -17,8 +17,8 @@ from .monitor import Monitor, Snapshot  # noqa: E402
 APP_ID = "dev.local.usbtracker"
 
 # Tree model columns.
-C_KEY, C_NAME, C_DRAW, C_BUDGET, C_STATUS, C_DROPS, C_DOT, C_DOTCOLOR, \
-    C_FG, C_FGSET, C_STYLE, C_WEIGHT = range(12)
+C_KEY, C_NAME, C_DRAW, C_BUDGET, C_TRAFFIC, C_STATUS, C_DROPS, C_DOT, \
+    C_DOTCOLOR, C_FG, C_FGSET, C_STYLE, C_WEIGHT = range(13)
 
 RANGES: list[tuple[str, float]] = [
     ("5 min", 300), ("15 min", 900), ("1 hour", 3600),
@@ -50,6 +50,7 @@ EVENT_COLOURS = {
     store.KIND_SUSPEND: "#9a9996",
     store.KIND_RESUME: "#3584e4",
     store.KIND_CONFIG: "#9141ac",
+    store.KIND_BANDWIDTH: "#9141ac",
     store.KIND_DRIVER: "#1c71d8",
     store.KIND_SESSION: "#77767b",
 }
@@ -70,6 +71,25 @@ def fmt_ma(value: float) -> str:
     if value < 10:
         return f"{value:.1f} mA"
     return f"{value:.0f} mA"
+
+
+def fmt_bps(value: float, style: str = "full") -> str:
+    """Bytes per second, scaled.
+
+    "full" reads as prose ("12.0 MB/s"), "axis" drops the rate for tick
+    labels ("12.0 MB"), "compact" fits a narrow table column ("12M").
+    """
+    if value <= 0:
+        return "0" if style != "full" else "–"
+    for unit, letter in (("B", "B"), ("kB", "k"), ("MB", "M"), ("GB", "G")):
+        if value < 1024 or unit == "GB":
+            digits = 0 if value >= 100 or unit == "B" else 1
+            if style == "compact":
+                return f"{value:.{digits}f}{letter}"
+            tail = unit if style == "axis" else f"{unit}/s"
+            return f"{value:.{digits}f} {tail}"
+        value /= 1024
+    return f"{value:.1f} TB/s"
 
 
 def fmt_ago(ts: float, now: float | None = None) -> str:
@@ -97,8 +117,14 @@ def nice_ceiling(value: float) -> float:
     return 10 * base
 
 
-class PowerGraph(Gtk.DrawingArea):
-    """Line graph of estimated draw, with absence bands and event markers."""
+COL_URB = (0.11, 0.60, 0.56)
+
+METRIC_POWER = "power"
+METRIC_BANDWIDTH = "bandwidth"
+
+
+class HistoryGraph(Gtk.DrawingArea):
+    """Line graph of draw or bandwidth, with absence bands and event markers."""
 
     def __init__(self):
         super().__init__()
@@ -113,6 +139,8 @@ class PowerGraph(Gtk.DrawingArea):
         self.t_end = time.time()
         self.show_budget = True
         self.show_subtree = False
+        self.show_urb = False
+        self.metric = METRIC_POWER
         self.title = ""
         self.hover_x: float | None = None
         self.on_readout = None
@@ -143,6 +171,27 @@ class PowerGraph(Gtk.DrawingArea):
 
     # -- drawing helpers
 
+    def _getters(self):
+        """(measured, declared, subtree) accessors for the current metric."""
+        if self.metric == METRIC_BANDWIDTH:
+            return (lambda s: (s[6] or 0.0) + (s[7] or 0.0),
+                    lambda s: s[8] or 0.0,
+                    lambda s: s[9] or 0.0)
+        return (lambda s: s[1], lambda s: s[2], lambda s: s[3])
+
+    def _fmt_value(self, value: float) -> str:
+        if self.metric == METRIC_BANDWIDTH:
+            return fmt_bps(value)
+        return fmt_ma(value)
+
+    def _fmt_tick(self, value: float, ymax: float) -> str:
+        if self.metric == METRIC_BANDWIDTH:
+            return fmt_bps(value, "axis")
+        return f"{value:.0f}" if ymax >= 10 else f"{value:.1f}"
+
+    def _unit(self) -> str:
+        return "B/s" if self.metric == METRIC_BANDWIDTH else "mA"
+
     def _fg(self) -> tuple[float, float, float]:
         try:
             c = self.get_color()
@@ -169,11 +218,11 @@ class PowerGraph(Gtk.DrawingArea):
     def _draw(self, _area, cr, width, height, _data=None):
         fr, fg, fb = self._fg()
         if not self.samples:
-            msg = self.title or "Select a device to see its power history"
+            msg = self.title or "Select a device to see its history"
             self._text(cr, width / 2, height / 2, msg, 12.5, "center", 0.55)
             return
 
-        left, right, top, bottom = 62, 16, 24, 26
+        left, right, top, bottom = 62, (54 if self.show_urb else 16), 24, 26
         pw = max(10, width - left - right)
         ph = max(10, height - top - bottom)
 
@@ -183,12 +232,14 @@ class PowerGraph(Gtk.DrawingArea):
             t0 = t1 - 60
         span = t1 - t0
 
-        vals = [s[1] for s in self.samples]
+        measured, declared, subtree = self._getters()
+        vals = [measured(s) for s in self.samples]
         if self.show_budget:
-            vals += [s[2] for s in self.samples]
+            vals += [declared(s) for s in self.samples]
         if self.show_subtree:
-            vals += [s[3] for s in self.samples]
+            vals += [subtree(s) for s in self.samples]
         ymax = nice_ceiling(max(vals + [1.0]) * 1.08)
+        urb_max = nice_ceiling(max([s[5] or 0.0 for s in self.samples] + [1.0]) * 1.1)
 
         def sx(ts: float) -> float:
             return left + (ts - t0) / span * pw
@@ -218,9 +269,16 @@ class PowerGraph(Gtk.DrawingArea):
             cr.move_to(left, y + 0.5)
             cr.line_to(left + pw, y + 0.5)
             cr.stroke()
-            label = f"{value:.0f}" if ymax >= 10 else f"{value:.1f}"
-            self._text(cr, left - 8, y + 3.5, label, 10.0, "right", 0.7)
-        self._text(cr, left - 8, top - 10, "mA", 9.5, "right", 0.55)
+            self._text(cr, left - 8, y + 3.5, self._fmt_tick(value, ymax), 10.0,
+                       "right", 0.7)
+            if self.show_urb:
+                self._text(cr, left + pw + 8, y + 3.5,
+                           f"{urb_max * i / steps:.0f}", 10.0, "left", 0.6,
+                           rgb=COL_URB)
+        self._text(cr, left - 8, top - 10, self._unit(), 9.5, "right", 0.55)
+        if self.show_urb:
+            self._text(cr, left + pw + 8, top - 10, "URB/s", 9.5, "left", 0.7,
+                       rgb=COL_URB)
 
         # vertical grid + time labels
         for ts, label in self._time_ticks(t0, t1):
@@ -257,14 +315,19 @@ class PowerGraph(Gtk.DrawingArea):
 
         gap = self._gap_threshold()
 
+        if self.show_urb:
+            def uy(value: float) -> float:
+                return top + ph - (max(0.0, min(value, urb_max)) / urb_max) * ph
+            self._line(cr, [(s[0], s[5] or 0.0) for s in self.samples], sx, uy,
+                       COL_URB, gap, width=1.2)
         if self.show_budget:
-            self._line(cr, [(s[0], s[2]) for s in self.samples], sx, sy, COL_BUDGET,
-                       gap, width=1.3, dash=[4.0, 3.0])
+            self._line(cr, [(s[0], declared(s)) for s in self.samples], sx, sy,
+                       COL_BUDGET, gap, width=1.3, dash=[4.0, 3.0])
         if self.show_subtree:
-            self._line(cr, [(s[0], s[3]) for s in self.samples], sx, sy, COL_SUBTREE,
-                       gap, width=1.6)
-        self._line(cr, [(s[0], s[1]) for s in self.samples], sx, sy, COL_EST, gap,
-                   width=2.0, fill_to=top + ph)
+            self._line(cr, [(s[0], subtree(s)) for s in self.samples], sx, sy,
+                       COL_SUBTREE, gap, width=1.6)
+        self._line(cr, [(s[0], measured(s)) for s in self.samples], sx, sy, COL_EST,
+                   gap, width=2.0, fill_to=top + ph)
 
         self._crosshair(cr, left, top, pw, ph, t0, span, sx, sy)
 
@@ -314,13 +377,14 @@ class PowerGraph(Gtk.DrawingArea):
         if self.hover_x is None or not (left <= self.hover_x <= left + pw):
             return
         ts = t0 + (self.hover_x - left) / pw * span
+        measured, declared, subtree = self._getters()
         nearest = min(self.samples, key=lambda s: abs(s[0] - ts))
         if abs(nearest[0] - ts) > self._gap_threshold():
             if self.on_readout:
                 self.on_readout(time.strftime("%H:%M:%S", time.localtime(ts))
                                 + "  ·  no data")
             return
-        x, y = sx(nearest[0]), sy(nearest[1])
+        x, y = sx(nearest[0]), sy(measured(nearest))
         fr, fg, fb = self._fg()
         cr.set_source_rgba(fr, fg, fb, 0.45)
         cr.set_line_width(1.0)
@@ -333,11 +397,19 @@ class PowerGraph(Gtk.DrawingArea):
         cr.arc(x, y, 3.4, 0, 2 * math.pi)
         cr.fill()
         if self.on_readout:
-            parts = [time.strftime("%H:%M:%S", time.localtime(nearest[0])),
-                     f"draw {fmt_ma(nearest[1])}",
-                     f"budget {fmt_ma(nearest[2])}"]
+            if self.metric == METRIC_BANDWIDTH:
+                parts = [time.strftime("%H:%M:%S", time.localtime(nearest[0])),
+                         f"in {fmt_bps(nearest[6] or 0.0)}",
+                         f"out {fmt_bps(nearest[7] or 0.0)}",
+                         f"reserved {self._fmt_value(declared(nearest))}"]
+            else:
+                parts = [time.strftime("%H:%M:%S", time.localtime(nearest[0])),
+                         f"draw {self._fmt_value(measured(nearest))}",
+                         f"budget {self._fmt_value(declared(nearest))}"]
             if self.show_subtree:
-                parts.append(f"subtree {fmt_ma(nearest[3])}")
+                parts.append(f"subtree {self._fmt_value(subtree(nearest))}")
+            if self.show_urb:
+                parts.append(f"{nearest[5] or 0.0:.0f} URB/s")
             if nearest[4]:
                 parts.append(nearest[4])
             self.on_readout("  ·  ".join(parts))
@@ -397,6 +469,10 @@ class TrackerWindow(Gtk.ApplicationWindow):
 
         self._build_header()
         self._build_body()
+        # Without this the filter entry takes focus on open and swallows
+        # whatever the user types next.
+        self.set_focus(self.tree)
+        GLib.idle_add(lambda: (self.set_focus(self.tree), False)[1])
         self.connect("close-request", self._on_close)
 
     # ---- chrome ---------------------------------------------------------
@@ -467,7 +543,7 @@ class TrackerWindow(Gtk.ApplicationWindow):
         box.append(head)
 
         self.model = Gtk.TreeStore(str, str, str, str, str, str, str, str, str,
-                                   bool, int, int)
+                                   str, bool, int, int)
         self.tree = Gtk.TreeView(model=self.model, headers_visible=True,
                                  enable_tree_lines=True)
         self.tree.set_tooltip_column(-1)
@@ -490,10 +566,11 @@ class TrackerWindow(Gtk.ApplicationWindow):
         self.tree.append_column(col)
         self.tree.set_expander_column(col)
 
-        for title, column, width, align in (("Draw", C_DRAW, 60, 1.0),
-                                            ("Budget", C_BUDGET, 62, 1.0),
-                                            ("State", C_STATUS, 80, 0.0),
-                                            ("Drops", C_DROPS, 50, 1.0)):
+        for title, column, width, align in (("Draw", C_DRAW, 54, 1.0),
+                                            ("Budget", C_BUDGET, 56, 1.0),
+                                            ("Traffic", C_TRAFFIC, 62, 1.0),
+                                            ("State", C_STATUS, 88, 0.0),
+                                            ("Drops", C_DROPS, 46, 1.0)):
             renderer = Gtk.CellRendererText(xalign=align, family="monospace")
             col = Gtk.TreeViewColumn(title, renderer, text=column, foreground=C_FG,
                                      style=C_STYLE)
@@ -533,6 +610,17 @@ class TrackerWindow(Gtk.ApplicationWindow):
         titles.append(self.device_sub)
         head.append(titles)
 
+        switcher = Gtk.Box(css_classes=["linked"], valign=Gtk.Align.CENTER)
+        self.metric_buttons: dict[str, Gtk.ToggleButton] = {}
+        for metric, label in ((METRIC_POWER, "Power"),
+                              (METRIC_BANDWIDTH, "Bandwidth")):
+            button = Gtk.ToggleButton(label=label,
+                                      active=metric == METRIC_POWER)
+            button.connect("toggled", self._on_metric, metric)
+            switcher.append(button)
+            self.metric_buttons[metric] = button
+        head.append(switcher)
+
         self.range_drop = Gtk.DropDown.new_from_strings([r[0] for r in RANGES])
         self.range_drop.set_selected(2)
         self.range_drop.set_tooltip_text("Time window")
@@ -540,7 +628,7 @@ class TrackerWindow(Gtk.ApplicationWindow):
         head.append(self.range_drop)
         top.append(head)
 
-        self.graph = PowerGraph()
+        self.graph = HistoryGraph()
         self.graph.on_readout = self._set_readout
         top.append(self.graph)
 
@@ -551,14 +639,19 @@ class TrackerWindow(Gtk.ApplicationWindow):
         self.subtree_toggle = Gtk.CheckButton(label="Including downstream",
                                               active=False)
         self.subtree_toggle.connect("toggled", self._on_series_toggle)
-        legend.append(self._swatch(COL_EST, "Estimated draw"))
+        self.urb_toggle = Gtk.CheckButton(label="Transfers (URB/s)", active=False)
+        self.urb_toggle.connect("toggled", self._on_series_toggle)
+        self.primary_swatch = self._swatch(COL_EST, "Estimated draw")
+        legend.append(self.primary_swatch)
         legend.append(self.budget_toggle)
         legend.append(self.subtree_toggle)
+        legend.append(self.urb_toggle)
         self.readout = Gtk.Label(xalign=1.0, hexpand=True, label="")
         self.readout.add_css_class("readout")
         self.readout.add_css_class("dim")
         legend.append(self.readout)
         top.append(legend)
+        self._sync_legend()
         pane.set_start_child(top)
 
         # --- bottom: history
@@ -598,6 +691,7 @@ class TrackerWindow(Gtk.ApplicationWindow):
 
     def _swatch(self, rgb, label: str) -> Gtk.Widget:
         box = Gtk.Box(spacing=6)
+        box.label_widget = None
         area = Gtk.DrawingArea(content_width=14, content_height=14,
                                valign=Gtk.Align.CENTER)
 
@@ -610,7 +704,8 @@ class TrackerWindow(Gtk.ApplicationWindow):
 
         area.set_draw_func(draw)
         box.append(area)
-        box.append(Gtk.Label(label=label))
+        box.label_widget = Gtk.Label(label=label)
+        box.append(box.label_widget)
         return box
 
     # ---- snapshot plumbing ---------------------------------------------
@@ -632,6 +727,10 @@ class TrackerWindow(Gtk.ApplicationWindow):
         if snap.lost_count:
             bits.append(f"{snap.lost_count} lost")
         bits.append(f"{fmt_ma(snap.total_ma)} estimated across all buses")
+        if snap.total_alloc_bps:
+            bits.append(f"{fmt_bps(snap.total_alloc_bps)} bus bandwidth reserved")
+        if snap.total_bps:
+            bits.append(f"{fmt_bps(snap.total_bps)} measured")
         if snap.paused:
             bits.append("paused")
         if not snap.kmsg_ok:
@@ -723,14 +822,23 @@ class TrackerWindow(Gtk.ApplicationWindow):
                         else f"{node.est_ma:.1f}")
             budget = f"{node.budget_ma:.0f}" if node.budget_ma else "–"
 
+        traffic = "–" if lost else self._traffic_text(node)
         drops = str(node.disconnects) if node.disconnects else "–"
         if node.resets or node.errors:
             drops += "!"
 
-        return [node.key, markup, draw, budget, state, drops,
+        return [node.key, markup, draw, budget, traffic, state, drops,
                 "●" if not lost else "○", dot_colour,
                 GHOST_FG, lost, int(Pango.Style.ITALIC) if lost else
                 int(Pango.Style.NORMAL), 400]
+
+    def _traffic_text(self, node) -> str:
+        """Measured throughput, or the reserved figure in parentheses."""
+        if node.measured:
+            return fmt_bps(node.total_bps, "compact") if node.total_bps else "0"
+        if node.alloc_bps > 0:
+            return f"({fmt_bps(node.alloc_bps, 'compact')})"
+        return "–"
 
     def _on_expand(self, _tree, it, _path, expanded: bool):
         key = self.model.get_value(it, C_KEY)
@@ -774,6 +882,12 @@ class TrackerWindow(Gtk.ApplicationWindow):
             bits.append(f"now {fmt_ma(node.est_ma)} of {fmt_ma(node.budget_ma)}")
             if node.is_hub:
                 bits.append(f"downstream total {fmt_ma(node.subtree_ma)}")
+            if node.alloc_bps:
+                bits.append(f"reserves {fmt_bps(node.alloc_bps)} of "
+                            f"{fmt_bps(node.link_bps)} link")
+            if node.measured:
+                bits.append(f"in {fmt_bps(node.rx_bps)} / out {fmt_bps(node.tx_bps)}"
+                            f" ({node.counter_source})")
             if node.urb_rate:
                 bits.append(f"{node.urb_rate:.0f} URB/s")
         else:
@@ -795,7 +909,7 @@ class TrackerWindow(Gtk.ApplicationWindow):
         key = self.selected_key
         self._refresh_detail_header()
         if not key:
-            self.graph.title = "Select a device to see its power history"
+            self.graph.title = "Select a device to see its history"
             now = time.time()
             self.graph.set_data([], [], now - 300, now)
             return
@@ -822,10 +936,33 @@ class TrackerWindow(Gtk.ApplicationWindow):
 
         self.graph.show_budget = self.budget_toggle.get_active()
         self.graph.show_subtree = self.subtree_toggle.get_active()
+        self.graph.show_urb = (self.urb_toggle.get_active()
+                               and self.graph.metric == METRIC_BANDWIDTH)
         node = self.snapshot.nodes.get(key)
         self.graph.title = ("No samples recorded yet for this device"
                            if node is None or not samples else "")
         self.graph.set_data(samples, events, t_start, now)
+
+    def _on_metric(self, button, metric):
+        if not button.get_active():
+            # keep one of the two always selected
+            if not any(b.get_active() for b in self.metric_buttons.values()):
+                button.set_active(True)
+            return
+        for name, other in self.metric_buttons.items():
+            if name != metric and other.get_active():
+                other.set_active(False)
+        self.graph.metric = metric
+        self._sync_legend()
+        self._refresh_graph()
+
+    def _sync_legend(self):
+        bandwidth = self.graph.metric == METRIC_BANDWIDTH
+        self.primary_swatch.label_widget.set_label(
+            "Measured throughput" if bandwidth else "Estimated draw")
+        self.budget_toggle.set_label(
+            "Reserved bandwidth" if bandwidth else "Declared budget")
+        self.urb_toggle.set_visible(bandwidth)
 
     def _on_series_toggle(self, _btn):
         self._refresh_graph()

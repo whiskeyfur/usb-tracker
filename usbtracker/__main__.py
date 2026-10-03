@@ -8,7 +8,7 @@ import sys
 import time
 
 from . import store
-from .monitor import Monitor
+from .monitor import Monitor, _bps
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,19 +53,26 @@ def cmd_list(args) -> int:
         mark = " " if node.present else "~"
         name = node.label if node.present else f"({node.label})"
         tree = f"{'  ' * depth}{name}"
-        print(f"{mark} {tree:<44.44}"
+        traffic = (_bps(node.total_bps) if node.measured
+                   else f"({_bps(node.alloc_bps)})" if node.alloc_bps else "–")
+        print(f"{mark} {tree:<40.40}"
               f"{node.est_ma:7.1f} /{node.budget_ma:6.0f} mA "
-              f"{node.subtree_ma:9.1f}  {node.status or 'lost':<10}"
+              f"{node.subtree_ma:8.1f} {traffic:>12} "
+              f"{node.urb_rate:7.0f} {node.status or 'lost':<10}"
               f"{node.busid}")
         for child in node.children:
             walk(child, depth + 1)
 
-    print(f"{'':2}{'device':<44}{'draw / budget':>18} {'subtree':>9}  "
-          f"{'state':<10}port")
+    print(f"{'':2}{'device':<40}{'draw / budget':>18} {'subtree':>8} "
+          f"{'traffic':>12} {'URB/s':>7} {'state':<10}port")
     for root in snap.roots:
         walk(root, 0)
     print(f"\n{snap.live_count} connected, {snap.lost_count} remembered but gone, "
-          f"{snap.total_ma:.0f} mA estimated in total")
+          f"{snap.total_ma:.0f} mA estimated in total, "
+          f"{_bps(snap.total_alloc_bps)} of bus bandwidth reserved"
+          + (f", {_bps(snap.total_bps)} measured" if snap.total_bps else ""))
+    print("Traffic in parentheses is reserved bandwidth: no byte counter "
+          "exists for that device.")
     mon._store.close()
     return 0
 
@@ -104,7 +111,8 @@ def cmd_daemon(args) -> int:
         if (snap.live_count, snap.lost_count) != last_count:
             last_count = (snap.live_count, snap.lost_count)
             print(f"{time.strftime('%H:%M:%S')}  {snap.live_count} connected, "
-                  f"{snap.lost_count} gone, {snap.total_ma:.0f} mA estimated")
+                  f"{snap.lost_count} gone, {snap.total_ma:.0f} mA estimated, "
+                  f"{_bps(snap.total_alloc_bps)} reserved")
         fresh = [e for e in mon._store.events(limit=200) if e[0] > cutoff]
         cutoff = snap.ts
         if first:

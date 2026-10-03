@@ -16,6 +16,12 @@ SYS_USB = "/sys/bus/usb/devices"
 ROOT_RE = re.compile(r"^usb(\d+)$")
 DEV_RE = re.compile(r"^(\d+)-(\d+(?:\.\d+)*)$")
 IFACE_RE = re.compile(r"^(?:\d+)-(?:\d+(?:\.\d+)*):(\d+)\.(\d+)$")
+EP_RE = re.compile(r"^ep_[0-9a-f]{2}$", re.I)
+
+SECTOR_BYTES = 512
+# Where the kernel keeps real byte counters for things that hang off USB.
+BLOCK_ROOT = "/sys/block"
+NET_ROOT = "/sys/class/net"
 
 # Suspended devices are allowed 2.5 mA by the spec; used to floor the estimate.
 SUSPEND_MA = 2.5
@@ -96,6 +102,29 @@ def _speed_label(mbps: float) -> str:
 
 
 @dataclass
+class Endpoint:
+    name: str
+    address: int
+    kind: str                  # Control / Interrupt / Isoc / Bulk
+    direction: str             # in / out / both
+    max_packet: int            # payload bytes per transaction
+    mult: int                  # extra transactions per interval (high-speed)
+    interval_us: float
+
+    @property
+    def periodic(self) -> bool:
+        """Only interrupt and isochronous endpoints reserve bus time."""
+        return self.kind in ("Interrupt", "Isoc") and self.interval_us > 0
+
+    @property
+    def reserved_bps(self) -> float:
+        """Bytes per second the host controller sets aside for this endpoint."""
+        if not self.periodic:
+            return 0.0
+        return self.max_packet * self.mult / (self.interval_us / 1e6)
+
+
+@dataclass
 class Interface:
     name: str
     number: int
@@ -103,6 +132,7 @@ class Interface:
     subclass: int
     protocol: int
     driver: str
+    endpoints: list["Endpoint"] = field(default_factory=list)
 
     @property
     def class_name(self) -> str:
@@ -144,6 +174,11 @@ class UsbDevice:
     over_current: int = 0
 
     interfaces: list[Interface] = field(default_factory=list)
+
+    # Byte counters, where something downstream of this device keeps them.
+    counter_source: str = ""     # e.g. "block:sdb", "net:enp0s20u2"
+    rx_bytes: int = 0            # cumulative, device -> host
+    tx_bytes: int = 0            # cumulative, host -> device
 
     # ---- presentation helpers -------------------------------------------
 
@@ -223,6 +258,41 @@ class UsbDevice:
         frac = self.active_fraction(prev)
         return budget * frac + SUSPEND_MA * (1.0 - frac)
 
+    @property
+    def endpoints(self) -> list[Endpoint]:
+        return [ep for iface in self.interfaces for ep in iface.endpoints]
+
+    @property
+    def reserved_bps(self) -> float:
+        """Periodic bandwidth reserved for this device's active configuration.
+
+        Reflects the *current* alternate setting, so a camera that starts
+        streaming really does show its isochronous reservation appear here.
+        """
+        return sum(ep.reserved_bps for ep in self.endpoints)
+
+    @property
+    def link_bps(self) -> float:
+        """Theoretical ceiling of the link, for context only."""
+        return self.speed_mbps * 1e6 / 8.0
+
+    def throughput(self, prev: "UsbDevice | None", dt: float) -> tuple[float, float]:
+        """Measured (rx, tx) bytes per second, or (0, 0) with no counter.
+
+        Only devices backing a block device or a network interface are
+        counted in bytes by the kernel; everything else has no byte counter
+        anywhere in sysfs.
+        """
+        if prev is None or dt <= 0 or not self.counter_source:
+            return (0.0, 0.0)
+        if self.counter_source != prev.counter_source:
+            return (0.0, 0.0)
+        d_rx = self.rx_bytes - prev.rx_bytes
+        d_tx = self.tx_bytes - prev.tx_bytes
+        if d_rx < 0 or d_tx < 0:            # counters reset on re-enumeration
+            return (0.0, 0.0)
+        return (d_rx / dt, d_tx / dt)
+
     def urb_rate(self, prev: "UsbDevice | None", dt: float) -> float:
         if prev is None or dt <= 0 or self.urbnum < prev.urbnum:
             return 0.0
@@ -252,6 +322,105 @@ def identity_key(dev: UsbDevice) -> str:
     return f"{dev.vid}:{dev.pid}@{dev.busid}"
 
 
+def _interval_us(text: str) -> float:
+    """sysfs writes the polling interval as '125us', '1ms', '256ms' or '0ms'."""
+    raw = text.strip().lower()
+    try:
+        if raw.endswith("us"):
+            return float(raw[:-2] or 0)
+        if raw.endswith("ms"):
+            return float(raw[:-2] or 0) * 1000.0
+        return float(raw or 0) * 1000.0
+    except ValueError:
+        return 0.0
+
+
+def _read_endpoints(iface_path: str) -> list[Endpoint]:
+    out: list[Endpoint] = []
+    try:
+        entries = sorted(os.listdir(iface_path))
+    except OSError:
+        return out
+    for entry in entries:
+        if not EP_RE.match(entry):
+            continue
+        epath = os.path.join(iface_path, entry)
+        packed = _hex(os.path.join(epath, "wMaxPacketSize"))
+        out.append(Endpoint(
+            name=entry,
+            address=_hex(os.path.join(epath, "bEndpointAddress")),
+            kind=_text(os.path.join(epath, "type")),
+            direction=_text(os.path.join(epath, "direction")),
+            # bits 0-10 are the payload, bits 11-12 the extra transactions
+            # a high-speed endpoint may make in the same interval
+            max_packet=packed & 0x7FF,
+            mult=1 + ((packed >> 11) & 0x3),
+            interval_us=_interval_us(_text(os.path.join(epath, "interval"))),
+        ))
+    return out
+
+
+def _counter_index() -> list[tuple[str, str, str]]:
+    """(sysfs real path, kind, name) for every block device and NIC.
+
+    Matched against USB devices by path prefix, so a stick plugged into a hub
+    is credited to the stick and not to the hub.
+    """
+    index: list[tuple[str, str, str]] = []
+    for root, kind in ((BLOCK_ROOT, "block"), (NET_ROOT, "net")):
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for name in names:
+            try:
+                real = os.path.realpath(os.path.join(root, name))
+            except OSError:
+                continue
+            index.append((real, kind, name))
+    return index
+
+
+def _read_counters(kind: str, name: str) -> tuple[int, int]:
+    """Cumulative (rx, tx) bytes: read/written for block, received/sent for net."""
+    if kind == "block":
+        fields = _text(os.path.join(BLOCK_ROOT, name, "stat")).split()
+        if len(fields) >= 7:
+            try:
+                return (int(fields[2]) * SECTOR_BYTES,
+                        int(fields[6]) * SECTOR_BYTES)
+            except ValueError:
+                return (0, 0)
+        return (0, 0)
+    base = os.path.join(NET_ROOT, name, "statistics")
+    return (_int(os.path.join(base, "rx_bytes")),
+            _int(os.path.join(base, "tx_bytes")))
+
+
+def _attach_counters(dev: UsbDevice, index: list[tuple[str, str, str]]) -> None:
+    """Credit a block device or NIC to the USB device that carries it."""
+    try:
+        base = os.path.realpath(os.path.join(SYS_USB, dev.busid)) + "/"
+    except OSError:
+        return
+    rx = tx = 0
+    sources: list[str] = []
+    for real, kind, name in index:
+        if not real.startswith(base):
+            continue
+        # A hub must not absorb the counters of devices plugged into it.
+        tail = real[len(base):]
+        if not tail.startswith(f"{dev.busid}:"):
+            continue
+        got_rx, got_tx = _read_counters(kind, name)
+        rx += got_rx
+        tx += got_tx
+        sources.append(f"{kind}:{name}")
+    if sources:
+        dev.counter_source = ",".join(sorted(sources))
+        dev.rx_bytes, dev.tx_bytes = rx, tx
+
+
 def _read_interfaces(path: str) -> list[Interface]:
     out: list[Interface] = []
     try:
@@ -276,11 +445,13 @@ def _read_interfaces(path: str) -> list[Interface]:
             subclass=_hex(os.path.join(ipath, "bInterfaceSubClass")),
             protocol=_hex(os.path.join(ipath, "bInterfaceProtocol")),
             driver=driver,
+            endpoints=_read_endpoints(ipath),
         ))
     return out
 
 
-def read_device(busid: str) -> UsbDevice | None:
+def read_device(busid: str, counters: list[tuple[str, str, str]] | None = None
+                ) -> UsbDevice | None:
     path = os.path.join(SYS_USB, busid)
     if not os.path.isdir(path):
         return None
@@ -323,6 +494,7 @@ def read_device(busid: str) -> UsbDevice | None:
     dev.urbnum = _int(p("urbnum"))
 
     dev.interfaces = _read_interfaces(path)
+    _attach_counters(dev, counters if counters is not None else _counter_index())
     dev.key = identity_key(dev)
     return dev
 
@@ -334,12 +506,13 @@ def scan() -> dict[str, UsbDevice]:
     except OSError:
         return {}
     devices: dict[str, UsbDevice] = {}
+    counters = _counter_index()
     for name in names:
         if ":" in name:          # an interface, collected with its device
             continue
         if not (ROOT_RE.match(name) or DEV_RE.match(name)):
             continue
-        dev = read_device(name)
+        dev = read_device(name, counters)
         if dev is not None:
             devices[name] = dev
     return devices

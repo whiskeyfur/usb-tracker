@@ -56,12 +56,23 @@ CREATE TABLE IF NOT EXISTS samples (
     budget_ma  REAL NOT NULL,
     subtree_ma REAL NOT NULL,
     status     TEXT DEFAULT '',
-    urb_rate   REAL DEFAULT 0
+    urb_rate   REAL DEFAULT 0,
+    rx_bps     REAL DEFAULT 0,
+    tx_bps     REAL DEFAULT 0,
+    alloc_bps  REAL DEFAULT 0,
+    sub_bps    REAL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS samples_key_ts ON samples (key, ts);
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
+
+# Columns added after the first release; existing databases get them on open.
+MIGRATIONS = {
+    "samples": (("rx_bps", "REAL DEFAULT 0"), ("tx_bps", "REAL DEFAULT 0"),
+                ("alloc_bps", "REAL DEFAULT 0"), ("sub_bps", "REAL DEFAULT 0")),
+    "devices": (("counter_source", "TEXT DEFAULT ''"),),
+}
 
 # Event kinds. Anything not in here still stores fine; this is for display.
 KIND_ATTACH = "attach"
@@ -75,6 +86,7 @@ KIND_OVERCURRENT = "over-current"
 KIND_RESET = "reset"
 KIND_ERROR = "bus error"
 KIND_FLAP = "flap"
+KIND_BANDWIDTH = "bandwidth"
 KIND_SESSION = "session"
 
 
@@ -94,6 +106,7 @@ class DeviceRow:
     version: str
     is_hub: bool
     self_powered: bool
+    counter_source: str
     first_seen: float
     last_seen: float
     present: bool
@@ -113,6 +126,8 @@ def _row_to_device(row: sqlite3.Row) -> DeviceRow:
         class_hint=row["class_hint"] or "", speed_mbps=row["speed_mbps"] or 0.0,
         max_power_ma=row["max_power_ma"] or 0, version=row["version"] or "",
         is_hub=bool(row["is_hub"]), self_powered=bool(row["self_powered"]),
+        counter_source=(row["counter_source"] if "counter_source" in row.keys()
+                        else "") or "",
         first_seen=row["first_seen"] or 0.0, last_seen=row["last_seen"] or 0.0,
         present=bool(row["present"]), connects=row["connects"] or 0,
         disconnects=row["disconnects"] or 0,
@@ -133,7 +148,18 @@ class Store:
         self.db.execute("PRAGMA busy_timeout=10000")
         if not read_only:
             self.db.executescript(SCHEMA)
+            self._migrate()
             self.db.commit()
+
+    def _migrate(self) -> None:
+        """Add columns a newer version expects, leaving existing rows intact."""
+        for table, columns in MIGRATIONS.items():
+            have = {r["name"] for r in
+                    self.db.execute(f"PRAGMA table_info({table})").fetchall()}
+            for name, decl in columns:
+                if name not in have:
+                    self.db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         try:
@@ -147,7 +173,8 @@ class Store:
                       vid: str, pid: str, serial: str, product: str,
                       manufacturer: str, class_hint: str, speed_mbps: float,
                       max_power_ma: int, version: str, is_hub: bool,
-                      self_powered: bool, ts: float, present: bool) -> bool:
+                      self_powered: bool, ts: float, present: bool,
+                      counter_source: str = "") -> bool:
         """Insert or refresh a device. Returns True if it was brand new."""
         cur = self.db.execute("SELECT key FROM devices WHERE key = ?", (key,))
         is_new = cur.fetchone() is None
@@ -155,20 +182,22 @@ class Store:
             self.db.execute(
                 """INSERT INTO devices (key, busid, parent_key, vid, pid, serial,
                        product, manufacturer, class_hint, speed_mbps, max_power_ma,
-                       version, is_hub, self_powered, first_seen, last_seen, present)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       version, is_hub, self_powered, first_seen, last_seen, present,
+                       counter_source)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (key, busid, parent_key, vid, pid, serial, product, manufacturer,
                  class_hint, speed_mbps, max_power_ma, version, int(is_hub),
-                 int(self_powered), ts, ts, int(present)))
+                 int(self_powered), ts, ts, int(present), counter_source))
         else:
             self.db.execute(
                 """UPDATE devices SET busid=?, parent_key=?, product=?,
                        manufacturer=?, class_hint=?, speed_mbps=?, max_power_ma=?,
-                       version=?, is_hub=?, self_powered=?, last_seen=?, present=?
+                       version=?, is_hub=?, self_powered=?, last_seen=?, present=?,
+                       counter_source=?
                    WHERE key=?""",
                 (busid, parent_key, product, manufacturer, class_hint, speed_mbps,
                  max_power_ma, version, int(is_hub), int(self_powered), ts,
-                 int(present), key))
+                 int(present), counter_source, key))
         return is_new
 
     def mark_absent(self, key: str, ts: float) -> None:
@@ -187,11 +216,15 @@ class Store:
                         (ts, key, kind, detail))
 
     def add_sample(self, ts: float, key: str, est_ma: float, budget_ma: float,
-                   subtree_ma: float, status: str, urb_rate: float) -> None:
+                   subtree_ma: float, status: str, urb_rate: float,
+                   rx_bps: float = 0.0, tx_bps: float = 0.0,
+                   alloc_bps: float = 0.0, sub_bps: float = 0.0) -> None:
         self.db.execute(
             """INSERT INTO samples (ts, key, est_ma, budget_ma, subtree_ma, status,
-                   urb_rate) VALUES (?,?,?,?,?,?,?)""",
-            (ts, key, est_ma, budget_ma, subtree_ma, status, urb_rate))
+                   urb_rate, rx_bps, tx_bps, alloc_bps, sub_bps)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (ts, key, est_ma, budget_ma, subtree_ma, status, urb_rate,
+             rx_bps, tx_bps, alloc_bps, sub_bps))
 
     def commit(self) -> None:
         self.db.commit()
@@ -227,11 +260,13 @@ class Store:
     def samples(self, key: str, since: float | None = None) -> list[tuple]:
         if since is None:
             cur = self.db.execute(
-                """SELECT ts, est_ma, budget_ma, subtree_ma, status, urb_rate
+                """SELECT ts, est_ma, budget_ma, subtree_ma, status, urb_rate,
+                          rx_bps, tx_bps, alloc_bps, sub_bps
                    FROM samples WHERE key=? ORDER BY ts""", (key,))
         else:
             cur = self.db.execute(
-                """SELECT ts, est_ma, budget_ma, subtree_ma, status, urb_rate
+                """SELECT ts, est_ma, budget_ma, subtree_ma, status, urb_rate,
+                          rx_bps, tx_bps, alloc_bps, sub_bps
                    FROM samples WHERE key=? AND ts>=? ORDER BY ts""", (key, since))
         return [tuple(r) for r in cur.fetchall()]
 
@@ -269,7 +304,8 @@ class Store:
             return self.samples(key, since)
         cur = self.db.execute(
             """SELECT MIN(ts), AVG(est_ma), MAX(budget_ma), AVG(subtree_ma),
-                      '', AVG(urb_rate)
+                      '', AVG(urb_rate), AVG(rx_bps), AVG(tx_bps),
+                      MAX(alloc_bps), AVG(sub_bps)
                  FROM samples WHERE key=? AND ts>=?
                  GROUP BY CAST((ts - ?) / ? AS INTEGER)
                  ORDER BY 1""",
