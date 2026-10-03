@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from usbtracker import store, sysfs                      # noqa: E402
+from usbtracker import power, store, sysfs               # noqa: E402
 from usbtracker.app import fmt_bps, fmt_ma, nice_ceiling  # noqa: E402
 from usbtracker.monitor import Monitor                   # noqa: E402
 from usbtracker.store import Store                       # noqa: E402
@@ -273,6 +273,51 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(db.devices(), [])
         self.assertEqual(db.events("k"), [])
         self.assertEqual(db.samples("k"), [])
+
+
+class PowerControlTests(unittest.TestCase):
+    """The bus id reaches a command line, so validation is the whole game."""
+
+    def test_rejects_anything_that_is_not_a_bus_id(self):
+        for bad in ("3-4; rm -rf /", "../../etc/passwd", "usb1$(id)",
+                    "3-4 4-5", "", "/sys/bus/usb/devices/3-4", "3-4\n4-5"):
+            with self.assertRaises(ValueError, msg=bad):
+                power.control_path(bad)
+
+    def test_accepts_real_bus_ids(self):
+        for good in ("usb1", "3-4", "3-4.1.2.3", "12-1.1"):
+            self.assertTrue(power.control_path(good).endswith("power/control"))
+
+    def test_command_targets_the_helper_when_installed(self):
+        real = power.helper_installed
+        try:
+            power.helper_installed = lambda: True
+            cmd = power.pkexec_command("3-4.1", False)
+            self.assertEqual(cmd[1:], [power.HELPER, "3-4.1", "on"])
+        finally:
+            power.helper_installed = real
+
+    def test_command_falls_back_to_a_one_off_write(self):
+        real = power.helper_installed
+        try:
+            power.helper_installed = lambda: False
+            cmd = power.pkexec_command("3-4.1", True)
+            self.assertEqual(cmd[1], "/bin/sh")
+            self.assertIn("auto", cmd[-1])
+            self.assertIn("/sys/bus/usb/devices/3-4.1/power/control", cmd[-1])
+        finally:
+            power.helper_installed = real
+
+    def test_udev_rule_matches_on_vendor_and_product(self):
+        rule = power.udev_rule("1b1c", "2b19", False, "Keyboard")
+        self.assertIn('ATTR{idVendor}=="1b1c"', rule)
+        self.assertIn('ATTR{idProduct}=="2b19"', rule)
+        self.assertIn('ATTR{power/control}="on"', rule)
+        self.assertIn("# Keyboard", rule)
+
+    def test_udev_rule_for_allowing_autosuspend(self):
+        self.assertIn('ATTR{power/control}="auto"',
+                      power.udev_rule("046d", "0892", True))
 
 
 class FormattingTests(unittest.TestCase):

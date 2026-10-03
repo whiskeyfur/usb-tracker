@@ -46,6 +46,8 @@ class Node:
     sub_bps: float = 0.0
     link_bps: float = 0.0
     counter_source: str = ""
+    control: str = ""            # "auto" = may autosuspend, "on" = kept awake
+    autosuspend_ms: int = -1
     first_seen: float = 0.0
     last_seen: float = 0.0
     connects: int = 0
@@ -65,6 +67,10 @@ class Node:
     @property
     def total_bps(self) -> float:
         return self.rx_bps + self.tx_bps
+
+    @property
+    def autosuspend_allowed(self) -> bool:
+        return self.control != "on"
 
     @property
     def measured(self) -> bool:
@@ -327,6 +333,10 @@ class Monitor:
             st.add_event(now, key, store.KIND_BANDWIDTH,
                          f"reserved bus bandwidth {_bps(before)} -> "
                          f"{_bps(after)}")
+        if prev.control != dev.control and prev.control and dev.control:
+            st.add_event(now, key, store.KIND_CONFIG,
+                         "autosuspend prevented (kept powered)"
+                         if dev.control == "on" else "autosuspend allowed")
         old_drivers, new_drivers = prev.drivers(), dev.drivers()
         if old_drivers != new_drivers:
             gone = [d for d in old_drivers if d not in new_drivers]
@@ -394,6 +404,8 @@ class Monitor:
                 sub_bps=sub_bps.get(key, 0.0),
                 link_bps=dev.link_bps if dev else 0.0,
                 counter_source=dev.counter_source if dev else row.counter_source,
+                control=dev.control if dev else "",
+                autosuspend_ms=dev.autosuspend_ms if dev else -1,
                 first_seen=row.first_seen, last_seen=row.last_seen,
                 connects=row.connects, disconnects=row.disconnects,
                 resets=kinds.get(store.KIND_RESET, 0),

@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
-from . import store  # noqa: E402
+from . import power, store  # noqa: E402
 from .monitor import Monitor, Snapshot  # noqa: E402
 
 APP_ID = "dev.local.usbtracker"
@@ -510,7 +511,11 @@ class TrackerWindow(Gtk.ApplicationWindow):
         for name, handler in (("forget-lost", self._act_forget_lost),
                               ("forget-one", self._act_forget_one),
                               ("export", self._act_export),
-                              ("about-power", self._act_about_power)):
+                              ("about-power", self._act_about_power),
+                              ("autosuspend-allow", self._act_autosuspend_allow),
+                              ("autosuspend-prevent", self._act_autosuspend_prevent),
+                              ("copy-udev", self._act_copy_udev),
+                              ("copy-info", self._act_copy_info)):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
             self.add_action(action)
@@ -548,6 +553,13 @@ class TrackerWindow(Gtk.ApplicationWindow):
                                  enable_tree_lines=True)
         self.tree.set_tooltip_column(-1)
         self.tree.get_selection().connect("changed", self._on_select)
+
+        right_click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        right_click.connect("pressed", self._on_right_click)
+        self.tree.add_controller(right_click)
+        self.context_menu = Gtk.PopoverMenu.new_from_model(self._context_model())
+        self.context_menu.set_parent(self.tree)
+        self.context_menu.set_has_arrow(False)
         self.tree.connect("row-expanded", self._on_expand, True)
         self.tree.connect("row-collapsed", self._on_expand, False)
 
@@ -832,6 +844,135 @@ class TrackerWindow(Gtk.ApplicationWindow):
                 GHOST_FG, lost, int(Pango.Style.ITALIC) if lost else
                 int(Pango.Style.NORMAL), 400]
 
+    def _context_model(self) -> Gio.Menu:
+        menu = Gio.Menu()
+        suspend = Gio.Menu()
+        suspend.append("Allow autosuspend", "win.autosuspend-allow")
+        suspend.append("Prevent autosuspend (keep powered)",
+                       "win.autosuspend-prevent")
+        suspend.append("Copy udev rule to make it stick", "win.copy-udev")
+        menu.append_section(None, suspend)
+
+        clipboard = Gio.Menu()
+        clipboard.append("Copy device details", "win.copy-info")
+        clipboard.append("Export history (CSV)", "win.export")
+        menu.append_section(None, clipboard)
+
+        forget = Gio.Menu()
+        forget.append("Forget this device", "win.forget-one")
+        menu.append_section(None, forget)
+        return menu
+
+    def _on_right_click(self, gesture, _n_press, x, y):
+        if self._show_context_menu(x, y):
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _show_context_menu(self, x: float, y: float) -> bool:
+        hit = self.tree.get_path_at_pos(int(x), int(y))
+        if hit is None:
+            return False
+        path = hit[0]
+        self.tree.get_selection().select_path(path)
+        node = self.snapshot.nodes.get(self.selected_key or "")
+
+        # Only offer what this row can actually do.
+        live = node is not None and node.present
+        allowed = bool(node and node.autosuspend_allowed)
+        self._set_action_enabled("autosuspend-allow", live and not allowed)
+        self._set_action_enabled("autosuspend-prevent", live and allowed)
+        self._set_action_enabled("copy-udev", node is not None and bool(node.vid))
+        self._set_action_enabled("copy-info", node is not None)
+        self._set_action_enabled("export", node is not None)
+        self._set_action_enabled("forget-one", node is not None and not live)
+
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        self.context_menu.set_pointing_to(rect)
+        self.context_menu.popup()
+        return True
+
+    def _set_action_enabled(self, name: str, enabled: bool) -> None:
+        action = self.lookup_action(name)
+        if action is not None:
+            action.set_enabled(enabled)
+
+    def _act_autosuspend_allow(self, *_):
+        self._change_autosuspend(True)
+
+    def _act_autosuspend_prevent(self, *_):
+        self._change_autosuspend(False)
+
+    def _change_autosuspend(self, allow: bool):
+        """Hand the change to pkexec off the UI thread; it shows its own dialog."""
+        node = self.snapshot.nodes.get(self.selected_key or "")
+        if node is None or not node.present:
+            self._toast("That device is not connected.")
+            return
+        busid = node.busid
+        self._toast("Waiting for authentication…" if not power.writable(busid)
+                    else "Applying…")
+
+        def work():
+            result = power.set_autosuspend(busid, allow)
+            GLib.idle_add(self._autosuspend_done, result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _autosuspend_done(self, result) -> bool:
+        self._toast(result.message)
+        if result.ok:
+            self.monitor.poke()
+        return False
+
+    def _act_copy_udev(self, *_):
+        node = self.snapshot.nodes.get(self.selected_key or "")
+        if node is None or not node.vid:
+            self._toast("No device selected.")
+            return
+        rule = power.udev_rule(node.vid, node.pid, node.autosuspend_allowed,
+                               node.label)
+        self._to_clipboard(
+            rule, "udev rule copied — save it as "
+                  "/etc/udev/rules.d/99-usb-power.rules")
+
+    def _act_copy_info(self, *_):
+        node = self.snapshot.nodes.get(self.selected_key or "")
+        if node is None:
+            self._toast("No device selected.")
+            return
+        lines = [
+            f"{node.label}",
+            f"  id            {node.vid}:{node.pid}",
+            f"  serial        {node.serial or '—'}",
+            f"  manufacturer  {node.manufacturer or '—'}",
+            f"  class         {node.class_hint}",
+            f"  port          {node.busid}",
+            f"  speed         {node.speed_label}",
+            f"  power         {fmt_ma(node.est_ma)} estimated of "
+            f"{fmt_ma(node.budget_ma)} declared",
+            f"  bandwidth     {fmt_bps(node.alloc_bps)} reserved"
+            + (f", {fmt_bps(node.total_bps)} measured ({node.counter_source})"
+               if node.measured else ""),
+            f"  transfers     {node.urb_rate:.0f} URB/s",
+            f"  autosuspend   {'allowed' if node.autosuspend_allowed else 'prevented'}"
+            + (f", delay {node.autosuspend_ms} ms"
+               if node.autosuspend_ms >= 0 else ""),
+            f"  drivers       {', '.join(node.drivers) or '—'}",
+            f"  drops         {node.disconnects} "
+            f"({node.connects} connects, {node.resets} resets)",
+        ]
+        self._to_clipboard("\n".join(lines) + "\n", "Device details copied.")
+
+    def _to_clipboard(self, text: str, message: str):
+        try:
+            value = GObject.Value(str, text)
+            self.get_clipboard().set_content(
+                Gdk.ContentProvider.new_for_value(value))
+        except Exception as exc:
+            self._toast(f"Could not copy: {exc}")
+            return
+        self._toast(message)
+
     def _traffic_text(self, node) -> str:
         """Measured throughput, or the reserved figure in parentheses."""
         if node.measured:
@@ -890,6 +1031,8 @@ class TrackerWindow(Gtk.ApplicationWindow):
                             f" ({node.counter_source})")
             if node.urb_rate:
                 bits.append(f"{node.urb_rate:.0f} URB/s")
+            bits.append("autosuspend allowed" if node.autosuspend_allowed
+                        else "autosuspend prevented")
         else:
             bits.append(f"last seen {fmt_ago(node.last_seen, self.snapshot.ts or None)}")
         bits.append(f"{node.connects} connects / {node.disconnects} drops")
@@ -1063,7 +1206,16 @@ class TrackerWindow(Gtk.ApplicationWindow):
             "is how you spot a hub budgeted past what its port can supply.\n\n"
             "Drops, resets and over-current trips are real: they come from "
             "sysfs appearing and disappearing, the port's over_current_count, "
-            "and the kernel ring buffer."
+            "and the kernel ring buffer.\n\n"
+            "<b>Autosuspend</b> can be changed from the right-click menu. "
+            "The kernel owns that setting, so the change goes through polkit "
+            "and you will be asked to authenticate. It lasts until the device "
+            "is replugged or the machine reboots — copy the udev rule from the "
+            "same menu to make it stick. "
+            + ("The polkit helper is installed, so one authentication covers "
+               "a run of changes." if power.helper_installed() else
+               "Running packaging/install-helper.sh narrows what is authorised "
+               "and stops polkit asking every single time.")
         )
         dialog = Gtk.AlertDialog(message="How power is estimated", detail=text)
         dialog.show(self)

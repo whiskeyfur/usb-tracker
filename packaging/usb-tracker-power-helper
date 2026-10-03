@@ -1,0 +1,36 @@
+#!/bin/sh
+# Sets one USB device's runtime power-management mode. Runs as root through
+# polkit; see dev.local.usbtracker.policy.
+#
+#   usb-tracker-power-helper <busid> <auto|on>
+#
+# Deliberately narrow: it writes one known attribute of one validated device
+# and nothing else. Never widen it to take a path.
+set -eu
+
+if [ "$#" -ne 2 ]; then
+    echo "usage: $(basename "$0") <busid> <auto|on>" >&2
+    exit 2
+fi
+
+busid=$1
+value=$2
+
+# Exactly the shapes sysfs uses: usb3, 3-4, 3-4.1.2
+if ! printf %s "$busid" | grep -Eq '^(usb[0-9]{1,3}|[0-9]{1,3}-[0-9]{1,3}(\.[0-9]{1,3})*)$'; then
+    echo "not a USB bus id: $busid" >&2
+    exit 2
+fi
+
+case $value in
+    auto|on) ;;
+    *) echo "value must be auto or on" >&2; exit 2 ;;
+esac
+
+target="/sys/bus/usb/devices/$busid/power/control"
+if [ ! -w "$target" ]; then
+    echo "no such USB device, or it has no power/control: $busid" >&2
+    exit 1
+fi
+
+printf %s "$value" > "$target"

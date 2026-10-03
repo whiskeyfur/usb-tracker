@@ -15,6 +15,9 @@ off and come back.
   returns and resets.
 - **Bottom right:** that device's event log.
 
+Right-click a device to allow or prevent autosuspend, copy a udev rule to make
+that stick, or export its history.
+
 Nothing to install beyond PyGObject and GTK 4, no root, no kernel module.
 
 ## Running
@@ -123,6 +126,49 @@ it keeps its history when you move it to another port. Without a serial, the
 port path *is* the identity — two identical serial-less devices genuinely
 cannot be told apart, and moving one to a different port reads as a new device.
 
+## Changing autosuspend
+
+Right-click any device in the tree:
+
+| Item | What it does |
+| --- | --- |
+| **Allow autosuspend** | Writes `auto` to the device's `power/control`, letting the kernel suspend it when idle. |
+| **Prevent autosuspend (keep powered)** | Writes `on`. Use this for the device that keeps dropping, waking slowly, or losing the first keystroke after an idle spell. |
+| **Copy udev rule to make it stick** | Puts a matching rule on the clipboard. |
+| **Copy device details** | Everything the app knows about the device, as text. |
+| **Export history (CSV)** | Samples and events for that device. |
+| **Forget this device** | Drops a device that is gone, with its history. |
+
+Autosuspend is the kernel's setting, and `power/control` is owned by root, so
+the change goes through **polkit** and you will be asked to authenticate. The
+app never escalates by itself — the authentication dialog is polkit's own, and
+you answer it.
+
+**The change does not survive a replug or a reboot**, because the kernel
+resets the attribute when the device re-enumerates. "Copy udev rule" gives you
+the durable form:
+
+```
+sudo tee /etc/udev/rules.d/99-usb-power.rules   # paste the rule, then:
+sudo udevadm control --reload
+```
+
+### Optional: narrow the authentication
+
+Out of the box the app asks pkexec to perform a one-off write, which means
+authorising a root shell, so polkit asks for a password every single time.
+Installing the helper replaces that with a dedicated polkit action that can do
+exactly one thing — set `power/control` on one validated device — and is
+remembered for the rest of your session:
+
+```bash
+./packaging/install-helper.sh
+```
+
+It installs two files, `/usr/libexec/usb-tracker/usb-tracker-power-helper` and
+`/usr/share/polkit-1/actions/dev.local.usbtracker.policy`, and prints the
+command to remove them again. The app picks it up automatically.
+
 ## Reading the tree
 
 | Marker | Meaning |
@@ -148,8 +194,10 @@ usbtracker/
   kmsg.py      scrapes dmesg for resets, over-current and enumeration failures
   monitor.py   diffs successive snapshots into events and samples
   store.py     SQLite: device roster, event log, power samples
-  app.py       GTK 4 window: tree, Cairo graph, history
+  power.py     reads and changes power/control, via polkit when needed
+  app.py       GTK 4 window: tree, Cairo graph, history, context menu
   __main__.py  CLI entry point
+packaging/     privileged helper, its polkit action, and an installer
 tests/         unit tests, with the sysfs scan injected
 ```
 
@@ -169,3 +217,6 @@ python3 -m unittest discover -s tests
 - The device tree uses `GtkTreeView`, deprecated in GTK 4.10 and still fully
   functional in GTK 4.14. Moving to `GtkColumnView` is the obvious future
   cleanup.
+- Autosuspend changes need polkit, and a polkit authentication agent has to be
+  running. Without one, pkexec has no way to ask, and the app reports that the
+  change was refused rather than failing silently.
