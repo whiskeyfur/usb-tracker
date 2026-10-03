@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="print the current tree once and exit")
     mode.add_argument("--events", action="store_true",
                       help="print the recorded event log and exit")
+    mode.add_argument("--outages", action="store_true",
+                      help="print recorded multi-device outages and exit")
+    mode.add_argument("--analyze", action="store_true",
+                      help="group this boot's kernel log into outages and say "
+                           "what they have in common")
     return parser
 
 
@@ -92,6 +97,35 @@ def cmd_events(args) -> int:
     return 0
 
 
+def cmd_outages(args) -> int:
+    db = store.Store(args.db)
+    rows = db.outages(limit=200)
+    if not rows:
+        print("No multi-device outages recorded yet.")
+        print("Run --analyze to look at this boot's kernel log instead.")
+        return 0
+    for ts, _key, _kind, detail in reversed(rows):
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}  {detail}")
+    db.close()
+    return 0
+
+
+def cmd_analyze(args) -> int:
+    from . import analyze
+    from .kmsg import boot_time
+    bursts, ok, error = analyze.collect()
+    if not ok:
+        print(f"Could not read the kernel log: {error}")
+        print("kernel.dmesg_restrict is probably set; try: sudo dmesg | "
+              "python3 -m usbtracker --analyze")
+        return 1
+    # Skip the first 60 seconds of uptime: that is the machine booting.
+    boot = boot_time()
+    for line in analyze.report(bursts, boot_cutoff=boot + 60 if boot else None):
+        print(line)
+    return 0
+
+
 def cmd_daemon(args) -> int:
     mon = _monitor_for_cli(args)
     stop = False
@@ -136,6 +170,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_list(args)
     if args.events:
         return cmd_events(args)
+    if args.outages:
+        return cmd_outages(args)
+    if args.analyze:
+        return cmd_analyze(args)
     if args.daemon:
         return cmd_daemon(args)
     try:

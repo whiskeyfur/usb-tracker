@@ -87,6 +87,9 @@ KIND_RESET = "reset"
 KIND_ERROR = "bus error"
 KIND_FLAP = "flap"
 KIND_BANDWIDTH = "bandwidth"
+KIND_OUTAGE = "outage"        # several devices vanished together
+KIND_STALL = "stall"          # the tracker itself stopped getting time
+KIND_CONTROLLER = "controller"  # the host controller complained
 KIND_SESSION = "session"
 
 
@@ -283,6 +286,17 @@ class Store:
         if where:
             sql += " WHERE " + " AND ".join(where)
         # id breaks ties so events logged in the same poll keep their order
+        sql += " ORDER BY ts DESC, id DESC LIMIT ?"
+        args.append(limit)
+        return [tuple(r) for r in self.db.execute(sql, args).fetchall()]
+
+    def outages(self, since: float | None = None, limit: int = 200) -> list[tuple]:
+        """Correlated outage events, newest first."""
+        sql = "SELECT ts, key, kind, detail FROM events WHERE kind = ?"
+        args: list = [KIND_OUTAGE]
+        if since is not None:
+            sql += " AND ts >= ?"
+            args.append(since)
         sql += " ORDER BY ts DESC, id DESC LIMIT ?"
         args.append(limit)
         return [tuple(r) for r in self.db.execute(sql, args).fetchall()]

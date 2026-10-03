@@ -247,6 +247,125 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(len(self.store.samples("abcd:1234:SN1")), 2)
 
 
+class OutageTests(unittest.TestCase):
+    """The case this app exists for: a hub taking its whole tree down."""
+
+    def setUp(self):
+        self.world: dict[str, UsbDevice] = {}
+        self.mon = Monitor(db_path=":memory:", interval=1.0, use_kmsg=False,
+                           scan_fn=lambda: dict(self.world))
+        self.mon._store = Store(":memory:")
+        self.mon._rows = {}
+        self.store = self.mon._store
+
+    def tree(self):
+        """A root hub, a hub on port 4, a second hub below it, four leaves."""
+        world = {
+            "usb3": device("usb3", serial="PCI3", product="Root hub",
+                           dev_class=0x09, power=0),
+            "3-4": device("3-4", serial="HUBA", product="USB2.1 Hub",
+                          dev_class=0x09),
+            "3-4.1": device("3-4.1", serial="HUBB", product="USB2.1 Hub",
+                            dev_class=0x09),
+        }
+        for n in range(1, 5):
+            world[f"3-4.1.{n}"] = device(f"3-4.1.{n}", serial=f"LEAF{n}",
+                                         product=f"Device {n}")
+        world["3-9"] = device("3-9", serial="OTHER", product="Unrelated device")
+        return world
+
+    def outage_details(self):
+        return [e[3] for e in self.store.outages()]
+
+    def test_hub_dropping_is_reported_once_and_attributed_to_the_hub(self):
+        self.world = self.tree()
+        self.mon.tick()
+
+        # The hub and everything behind it vanish in the same poll.
+        for busid in ("3-4", "3-4.1", "3-4.1.1", "3-4.1.2", "3-4.1.3", "3-4.1.4"):
+            self.world.pop(busid, None)
+        self.mon.tick()
+
+        details = self.outage_details()
+        self.assertEqual(len(details), 1, "one outage, not six disconnects")
+        self.assertIn("hub at 3-4", details[0])
+        self.assertIn("6 devices", details[0])
+
+    def test_unrelated_device_is_not_swept_into_the_outage(self):
+        self.world = self.tree()
+        self.mon.tick()
+        for busid in ("3-4", "3-4.1", "3-4.1.1", "3-4.1.2"):
+            self.world.pop(busid)
+        self.mon.tick()
+        self.assertIn("3-4", self.outage_details()[0])
+        kinds = [e[2] for e in self.store.events("abcd:1234:OTHER")]
+        self.assertEqual(kinds, [store.KIND_ATTACH],
+                         "a device that stayed up never dropped")
+
+    def test_recovery_is_logged_with_how_long_it_took(self):
+        self.world = self.tree()
+        self.mon.tick()
+        gone = {b: self.world[b] for b in
+                ("3-4", "3-4.1", "3-4.1.1", "3-4.1.2", "3-4.1.3", "3-4.1.4")}
+        for busid in gone:
+            del self.world[busid]
+        self.mon.tick()
+        self.world.update(gone)
+        self.mon.tick()
+        details = self.outage_details()
+        self.assertEqual(len(details), 2)
+        self.assertIn("back after", details[0])
+        self.assertIn("6 of 6 devices returned", details[0])
+        self.assertIsNone(self.mon._outage)
+
+    def test_a_single_unplug_is_not_an_outage(self):
+        self.world = self.tree()
+        self.mon.tick()
+        del self.world["3-9"]
+        self.mon.tick()
+        self.assertEqual(self.outage_details(), [])
+
+    def test_drops_spanning_controllers_read_as_system_wide(self):
+        self.world = self.tree()
+        self.world["usb1"] = device("usb1", serial="PCI1", dev_class=0x09, power=0)
+        self.world["1-1"] = device("1-1", serial="OTHERBUS")
+        self.world["4-1"] = device("4-1", serial="THIRDBUS")
+        self.mon.tick()
+        for busid in ("3-4.1.1", "1-1", "4-1"):
+            del self.world[busid]
+        self.mon.tick()
+        self.assertIn("system-wide", self.outage_details()[0])
+
+    def test_devices_that_never_return_are_not_called_an_outage(self):
+        self.world = self.tree()
+        self.mon.tick()
+        for busid in ("3-4.1.1", "3-4.1.2", "3-4.1.3"):
+            del self.world[busid]
+        self.mon.tick()
+        self.mon._outage["start"] -= 1000      # pretend a long time passed
+        self.mon.tick()
+        self.assertIn("never came back", self.outage_details()[0])
+
+    def test_a_starved_poll_loop_is_recorded(self):
+        self.world = self.tree()
+        self.mon.tick()
+        self.mon._prev_ts -= 30                # the tick arrived 30s late
+        self.mon._skip_stall = False
+        self.mon.tick()
+        kinds = [e[2] for e in self.store.events("")]
+        self.assertIn(store.KIND_STALL, kinds)
+
+    def test_pausing_is_not_mistaken_for_a_stall(self):
+        self.world = self.tree()
+        self.mon.tick()
+        self.mon.set_paused(True)
+        self.mon.set_paused(False)
+        self.mon._prev_ts -= 30
+        self.mon.tick()
+        kinds = [e[2] for e in self.store.events("")]
+        self.assertNotIn(store.KIND_STALL, kinds)
+
+
 class StoreTests(unittest.TestCase):
     def test_bucketing_averages_long_windows(self):
         db = Store(":memory:")

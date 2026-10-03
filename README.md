@@ -4,6 +4,11 @@ A desktop app for watching what is on your USB buses: how much power each
 device is budgeted for, how much bus bandwidth it uses, and when things drop
 off and come back.
 
+It is built for one problem in particular: **a cluster of USB devices
+vanishing together for a second or two.** When that happens the app does not
+log fifteen unrelated disconnects — it correlates them into a single outage
+and names what they had in common.
+
 ![layout](docs/layout.png)
 
 - **Left:** the live device tree, hub by hub. Devices that were seen and are
@@ -29,7 +34,9 @@ Nothing to install beyond PyGObject and GTK 4, no root, no kernel module.
 or `python3 -m usbtracker`. Other modes:
 
 ```bash
+python3 -m usbtracker --analyze         # diagnose from this boot's kernel log
 python3 -m usbtracker --daemon          # record in a terminal, no window
+python3 -m usbtracker --outages         # print recorded multi-device outages
 python3 -m usbtracker --list            # print the tree once and exit
 python3 -m usbtracker --events          # print the recorded event log
 ```
@@ -53,6 +60,48 @@ sudo apt install python3-gi gir1.2-gtk-4.0
 The headless modes (`--list`, `--events`, `--daemon`) need neither.
 
 ![bandwidth view](docs/bandwidth.png)
+
+## When everything drops at once
+
+Devices behind a hub do not fail independently. If a hub loses power, or its
+upstream cable glitches, every device behind it disappears inside the same
+second and comes back together. Logged device by device that looks like
+chaos; correlated, it is one fault with one address.
+
+The tracker groups disconnects that land within 8 seconds of each other, finds
+the deepest point in the tree they all hang off, and records a single `outage`
+event naming it — plus a second when they come back, with how long it took. A
+red banner appears in the window, and **Outage report** in the menu lists what
+has been seen.
+
+The shape of the drop tells you where the fault is:
+
+| What the log shows | What it means |
+| --- | --- |
+| The hub drops *first*, then its children | The hub itself lost power or its upstream link. Suspect its PSU, its cable, or the port it is in. |
+| Children drop but the hub survives | The hub is fine; it cut power downstream or a shared downstream rail sagged. Suspect total current draw. |
+| Devices across several controllers drop | Genuinely system-wide. Suspect the PSU, a PCIe/ASPM problem, or an SMI stall. |
+| Accompanied by `controller` events | The host controller itself fell over — `xHCI host controller not responding` and friends. That is a different problem from a hub dropping. |
+| A `stall` event at the same moment | The *tracker* stopped getting CPU, so the machine itself hiccuped. USB may not be the cause at all. |
+
+### Diagnosing without waiting for it to happen again
+
+The kernel ring buffer already holds this boot's history, so you do not have
+to catch the next one live:
+
+```bash
+python3 -m usbtracker --analyze
+```
+
+It groups the log into disturbances, reports what each one had in common, and
+says so plainly when every one of them points at the same hub.
+
+### Catching the next one
+
+An intermittent fault needs something always running. `packaging/` has a
+systemd user service that records continuously; see
+[packaging/README.md](packaging/README.md). The window reads the same
+database, so its history shows up there too.
 
 ## How power is measured — read this before trusting a number
 
@@ -119,6 +168,9 @@ and URB rate and does not pretend to know the byte count.
 | `suspend` / `resume` | Runtime power management parked or woke the device. |
 | `config` | Power budget, configuration or link speed changed. |
 | `bandwidth` | The device's reserved periodic bandwidth changed — typically a camera or audio interface switching alternate setting as a stream starts or stops. |
+| `outage` | Several devices dropped together, attributed to what they share; a second one records the recovery and its duration. |
+| `controller` | The host controller itself reported trouble (`xHCI host controller not responding`, `HC died`, reset or halt failures). |
+| `stall` | The tracker went unscheduled for far longer than its interval — the machine was busy, asleep, or stopped. Events in that window may be missing. |
 | `driver` | A kernel driver bound to or released an interface. |
 
 A device is identified by `idVendor:idProduct:serial` where a serial exists, so
@@ -191,7 +243,9 @@ care about or export a device's samples and events as CSV.
 usbtracker/
   sysfs.py     reads /sys/bus/usb/devices into a snapshot, including
                endpoint descriptors and any attached byte counters
-  kmsg.py      scrapes dmesg for resets, over-current and enumeration failures
+  kmsg.py      scrapes dmesg for resets, over-current, enumeration failures
+               and host-controller faults
+  analyze.py   groups the kernel log into outages and reports the common cause
   monitor.py   diffs successive snapshots into events and samples
   store.py     SQLite: device roster, event log, power samples
   power.py     reads and changes power/control, via polkit when needed
@@ -211,7 +265,10 @@ python3 -m unittest discover -s tests
 - `dmesg` scraping is skipped silently when `kernel.dmesg_restrict` is set; the
   app still tracks everything sysfs can see. The header says when this happens.
 - Polling means a device that drops and returns between two polls is invisible
-  to the sysfs diff — but the kernel log usually still catches it.
+  to the sysfs diff — but the kernel log usually still catches it. For chasing
+  brief outages, run with `--interval 0.5`.
+- Outage correlation needs at least three devices to drop together. A hub with
+  one device behind it reads as an ordinary disconnect.
 - Byte-level throughput is only available for devices the kernel already counts
   (storage, network). Everything else would need `usbmon`, which requires root.
 - The device tree uses `GtkTreeView`, deprecated in GTK 4.10 and still fully

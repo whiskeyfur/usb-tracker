@@ -16,6 +16,19 @@ from .sysfs import UsbDevice
 # port losing contact.
 FLAP_WINDOW = 20.0
 
+# When a hub loses power, or a controller falls over, devices do not drop one
+# at a time -- a cluster goes within a second or two and comes back together.
+# Reporting that as one attributed event is far more use than fourteen
+# unrelated disconnects.
+OUTAGE_MIN_DEVICES = 3
+OUTAGE_WINDOW = 8.0          # drops this close together are the same event
+OUTAGE_GIVE_UP = 180.0       # after this, treat it as an unplug, not an outage
+OUTAGE_RECOVERED = 0.8       # share of devices back before calling it over
+
+# A poll this much later than asked for means the tracker itself was starved.
+STALL_FACTOR = 3.0
+STALL_FLOOR = 2.0
+
 
 @dataclass
 class Node:
@@ -83,6 +96,9 @@ class Snapshot:
     ts: float = 0.0
     nodes: dict[str, Node] = field(default_factory=dict)
     roots: list[str] = field(default_factory=list)
+    outages_24h: int = 0
+    last_outage: str = ""
+    outage_open: bool = False
     total_ma: float = 0.0
     total_bps: float = 0.0
     total_alloc_bps: float = 0.0
@@ -117,6 +133,9 @@ class Monitor:
         self._prev: dict[str, UsbDevice] = {}
         self._prev_ts = 0.0
         self._rows: dict[str, DeviceRow] = {}
+        self._recent_drops: list[tuple[float, str, str]] = []
+        self._outage: dict | None = None
+        self._skip_stall = True
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -142,6 +161,7 @@ class Monitor:
 
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
+        self._skip_stall = True      # a pause is not a stall
         self._wake.set()
 
     def set_interval(self, interval: float) -> None:
@@ -257,6 +277,7 @@ class Monitor:
                 self._diff_device(st, now, key, prev, dev)
 
         # --- disappearances
+        dropped: list[tuple[str, str]] = []
         for key, prev in self._prev.items():
             if key in live:
                 continue
@@ -264,6 +285,11 @@ class Monitor:
                          f"gone from {prev.port_path}")
             st.bump_counter(key, "disconnects")
             st.mark_absent(key, now)
+            dropped.append((key, prev.busid))
+
+        self._check_stall(st, now)
+        self._note_drops(st, now, dropped)
+        self._check_recovery(st, now, live)
 
         # --- samples
         for key, dev in live.items():
@@ -276,10 +302,16 @@ class Monitor:
 
         # --- kernel log extras
         if self.kmsg is not None:
+            pci_to_key = {d.serial: k for k, d in live.items()
+                          if d.is_root_hub and d.serial}
             for kts, busid, kind, detail in self.kmsg.poll():
-                key = busid_to_key.get(busid, "")
-                if not key:
-                    key = self._last_key_for_busid(busid)
+                if busid.startswith("pci:"):
+                    key = pci_to_key.get(busid[4:], "")
+                    detail = f"{detail} [{busid[4:]}]" if not key else detail
+                else:
+                    key = busid_to_key.get(busid, "")
+                    if not key:
+                        key = self._last_key_for_busid(busid)
                 if kind in (store.KIND_DISCONNECT, store.KIND_CONNECT):
                     # sysfs polling already covers these; keep only the
                     # diagnoses polling cannot see.
@@ -299,6 +331,95 @@ class Monitor:
         if self.on_snapshot is not None:
             self.on_snapshot(snap)
         return snap
+
+    def _check_stall(self, st: Store, now: float) -> None:
+        """Notice when the tracker itself stopped getting scheduled."""
+        if not self._prev_ts:
+            return
+        if self._skip_stall:
+            self._skip_stall = False
+            return
+        gap = now - self._prev_ts
+        if gap - self.interval > max(STALL_FLOOR, self.interval * STALL_FACTOR):
+            st.add_event(now, "", store.KIND_STALL,
+                         f"no polling for {_dur(gap)} -- machine busy, asleep, "
+                         f"or the tracker was stopped; USB events in that "
+                         f"window may be missing")
+
+    def _note_drops(self, st: Store, now: float,
+                    dropped: list[tuple[str, str]]) -> None:
+        if dropped:
+            self._recent_drops.extend((now, key, busid) for key, busid in dropped)
+        cutoff = now - OUTAGE_WINDOW
+        self._recent_drops = [d for d in self._recent_drops if d[0] >= cutoff]
+
+        if self._outage is not None:
+            # a cascade still unfolding belongs to the outage already open
+            for _ts, key, busid in self._recent_drops:
+                self._outage["keys"].add(key)
+                if busid not in self._outage["busids"]:
+                    self._outage["busids"].append(busid)
+            return
+
+        if len(self._recent_drops) < OUTAGE_MIN_DEVICES:
+            return
+
+        keys = {key for _ts, key, _b in self._recent_drops}
+        busids = [b for _ts, _k, b in self._recent_drops]
+        scope = _common_ancestor(busids)
+        self._outage = {
+            "start": min(ts for ts, _k, _b in self._recent_drops),
+            "keys": set(keys),
+            "busids": list(dict.fromkeys(busids)),
+            "scope": scope,
+        }
+        st.add_event(now, "", store.KIND_OUTAGE,
+                     self._describe_outage(len(keys), scope, busids))
+
+    def _describe_outage(self, count: int, scope: str | None,
+                         busids: list[str]) -> str:
+        if scope is None:
+            buses = {b.split("-")[0] for b in busids if "-" in b}
+            return (f"{count} devices across {len(buses)} controllers went away "
+                    f"at once -- this looks system-wide")
+        label = self._label_for_busid(scope)
+        named = f"{scope} ({label})" if label else scope
+        if scope.startswith("usb"):
+            return (f"{count} devices went away with the whole controller "
+                    f"{named}")
+        if scope in busids:
+            return (f"{count} devices went away with the hub at {named} -- "
+                    f"the hub dropped first and took everything behind it")
+        return f"{count} devices behind {named} went away together"
+
+    def _label_for_busid(self, busid: str) -> str:
+        for dev in self._prev.values():
+            if dev.busid == busid:
+                return dev.label
+        for row in self._rows.values():
+            if row.busid == busid:
+                return row.label
+        return ""
+
+    def _check_recovery(self, st: Store, now: float,
+                        live: dict[str, UsbDevice]) -> None:
+        if self._outage is None:
+            return
+        keys = self._outage["keys"]
+        back = {k for k in keys if k in live}
+        elapsed = now - self._outage["start"]
+        if len(back) >= max(1, int(len(keys) * OUTAGE_RECOVERED)):
+            scope = self._outage["scope"] or "several controllers"
+            st.add_event(now, "", store.KIND_OUTAGE,
+                         f"back after {_dur(elapsed)} -- {len(back)} of "
+                         f"{len(keys)} devices returned on {scope}")
+            self._outage = None
+        elif elapsed > OUTAGE_GIVE_UP:
+            st.add_event(now, "", store.KIND_OUTAGE,
+                         f"{len(keys) - len(back)} of {len(keys)} devices never "
+                         f"came back after {_dur(elapsed)} -- treating it as an "
+                         f"unplug rather than an outage")
+            self._outage = None
 
     def _last_key_for_busid(self, busid: str) -> str:
         for row in self._rows.values():
@@ -445,7 +566,37 @@ class Monitor:
             snap.kmsg_ok = self.kmsg.available
             snap.kmsg_error = self.kmsg.error
         snap.db_bytes = st.db_size()
+        recent = st.outages(since=now - 86400, limit=100)
+        starts = [r for r in recent if "back after" not in r[3]
+                  and "never came back" not in r[3]]
+        snap.outages_24h = len(starts)
+        snap.last_outage = starts[0][3] if starts else ""
+        snap.outage_open = self._outage is not None
         return snap
+
+
+def _common_ancestor(busids: list[str]) -> str | None:
+    """The deepest point every dropped device hangs off.
+
+    Fourteen devices going at once is not fourteen faults; it is one fault at
+    whatever they share. None means they spanned controllers.
+    """
+    paths = [b for b in busids if "-" in b]
+    if not paths:
+        roots = {b for b in busids}
+        return roots.pop() if len(roots) == 1 else None
+    buses = {b.split("-", 1)[0] for b in paths}
+    if len(buses) != 1 or len(buses) != len({b.split("-", 1)[0] for b in busids}):
+        return None
+    bus = buses.pop()
+    segments = [b.split("-", 1)[1].split(".") for b in paths]
+    common: list[str] = []
+    for parts in zip(*segments):
+        if len(set(parts)) == 1:
+            common.append(parts[0])
+        else:
+            break
+    return f"{bus}-{'.'.join(common)}" if common else f"usb{bus}"
 
 
 def _bps(value: float) -> str:

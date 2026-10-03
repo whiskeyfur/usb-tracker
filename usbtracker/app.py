@@ -54,6 +54,9 @@ EVENT_COLOURS = {
     store.KIND_BANDWIDTH: "#9141ac",
     store.KIND_DRIVER: "#1c71d8",
     store.KIND_SESSION: "#77767b",
+    store.KIND_OUTAGE: "#c01c28",
+    store.KIND_STALL: "#e5a50a",
+    store.KIND_CONTROLLER: "#a51d2d",
 }
 
 CSS = b"""
@@ -63,6 +66,11 @@ CSS = b"""
 .pane-head { padding: 6px 10px; }
 .card-head { border-bottom: 1px solid alpha(currentColor, 0.12); }
 .readout { font-family: monospace; font-size: 0.92rem; }
+.banner {
+    background: alpha(#e01b24, 0.13);
+    border-bottom: 1px solid alpha(#e01b24, 0.35);
+    padding: 8px 12px;
+}
 """
 
 
@@ -501,6 +509,7 @@ class TrackerWindow(Gtk.ApplicationWindow):
         header.pack_start(self.interval_spin)
 
         menu = Gio.Menu()
+        menu.append("Outage report", "win.outage-report")
         menu.append("Forget lost devices", "win.forget-lost")
         menu.append("Forget this device", "win.forget-one")
         menu.append("Export selected history (CSV)", "win.export")
@@ -515,7 +524,8 @@ class TrackerWindow(Gtk.ApplicationWindow):
                               ("autosuspend-allow", self._act_autosuspend_allow),
                               ("autosuspend-prevent", self._act_autosuspend_prevent),
                               ("copy-udev", self._act_copy_udev),
-                              ("copy-info", self._act_copy_info)):
+                              ("copy-info", self._act_copy_info),
+                              ("outage-report", self._act_outage_report)):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
             self.add_action(action)
@@ -523,13 +533,34 @@ class TrackerWindow(Gtk.ApplicationWindow):
         self.set_titlebar(header)
 
     def _build_body(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        self.banner = Gtk.Revealer(reveal_child=False)
+        banner_box = Gtk.Box(spacing=10)
+        banner_box.add_css_class("banner")
+        self.banner_label = Gtk.Label(xalign=0.0, hexpand=True, wrap=True)
+        banner_box.append(self.banner_label)
+        details = Gtk.Button(label="Details")
+        details.set_action_name("win.outage-report")
+        banner_box.append(details)
+        dismiss = Gtk.Button(icon_name="window-close-symbolic",
+                             tooltip_text="Hide until the next outage")
+        dismiss.add_css_class("flat")
+        dismiss.connect("clicked", self._dismiss_banner)
+        banner_box.append(dismiss)
+        self.banner.set_child(banner_box)
+        self._banner_dismissed_for = ""
+        box.append(self.banner)
+
         outer = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         outer.set_position(556)
         outer.set_shrink_start_child(False)
         outer.set_shrink_end_child(False)
         outer.set_start_child(self._build_tree_pane())
         outer.set_end_child(self._build_detail_pane())
-        self.set_child(outer)
+        outer.set_vexpand(True)
+        box.append(outer)
+        self.set_child(box)
 
     def _build_tree_pane(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -731,7 +762,49 @@ class TrackerWindow(Gtk.ApplicationWindow):
         self._refresh_graph()
         self._refresh_history()
         self._update_header()
+        self._update_banner()
         return False
+
+    def _update_banner(self):
+        snap = self.snapshot
+        if snap.outage_open:
+            text = "USB outage happening now — devices are missing."
+        elif snap.outages_24h:
+            plural = "" if snap.outages_24h == 1 else "s"
+            text = (f"{snap.outages_24h} multi-device outage{plural} in the last "
+                    f"24 hours. Most recent: {snap.last_outage}")
+        else:
+            self.banner.set_reveal_child(False)
+            return
+        if text == self._banner_dismissed_for:
+            return
+        self.banner_label.set_label(text)
+        self.banner.set_reveal_child(True)
+
+    def _dismiss_banner(self, _button):
+        self._banner_dismissed_for = self.banner_label.get_label()
+        self.banner.set_reveal_child(False)
+
+    def _act_outage_report(self, *_):
+        rows = self.reader.outages(limit=60)
+        if not rows:
+            detail = ("Nothing recorded yet.\n\nThe tracker only sees outages "
+                      "while it is running. To look at what already happened "
+                      "this boot, run:\n\n    python3 -m usbtracker --analyze\n\n"
+                      "and leave --daemon running to catch the next one.")
+        else:
+            lines = []
+            for ts, _key, _kind, text in rows[:20]:
+                lines.append(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}"
+                             f"  {text}")
+            detail = "\n".join(lines)
+            if len(rows) > 20:
+                detail += f"\n\n…and {len(rows) - 20} earlier entries."
+            detail += ("\n\nFor this boot's full history from the kernel log, "
+                       "including what the devices have in common, run:\n"
+                       "    python3 -m usbtracker --analyze")
+        dialog = Gtk.AlertDialog(message="Outages", detail=detail)
+        dialog.show(self)
 
     def _update_header(self):
         snap = self.snapshot

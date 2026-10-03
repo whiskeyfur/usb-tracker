@@ -41,6 +41,29 @@ PATTERNS: list[tuple[re.Pattern, str, str]] = [
      store.KIND_ERROR, "enumeration failed"),
     (re.compile(r"^usb (?P<bus>\S+): device-level power management is disabled"),
      store.KIND_ERROR, "device-level power management disabled"),
+
+    # Host-controller trouble. These name a PCI address rather than a bus id;
+    # the monitor maps it back through the root hubs' serial numbers.
+    (re.compile(r"^xhci_hcd (?P<pci>\S+): xHCI host controller not responding"),
+     store.KIND_CONTROLLER, "host controller stopped responding"),
+    (re.compile(r"^xhci_hcd (?P<pci>\S+): HC died"),
+     store.KIND_CONTROLLER, "host controller died, kernel is cleaning up"),
+    (re.compile(r"^xhci_hcd (?P<pci>\S+): Host halt failed"),
+     store.KIND_CONTROLLER, "host controller halt failed"),
+    (re.compile(r"^xhci_hcd (?P<pci>\S+): Host (?:not accessible|controller not "
+                r"halted), reset failed"),
+     store.KIND_CONTROLLER, "host controller reset failed"),
+    (re.compile(r"^xhci_hcd (?P<pci>\S+): Timeout while waiting for (?P<what>.+)"),
+     store.KIND_CONTROLLER, "controller timeout waiting for {what}"),
+    (re.compile(r"^usb usb(?P<hub>\d+)-port(?P<port>\d+): Cannot enable"),
+     store.KIND_ERROR, "port would not enable (kernel suspects the cable)"),
+    (re.compile(r"^usb (?P<bus>\S+?)-port(?P<port>\d+): Cannot enable"),
+     store.KIND_ERROR, "port {port} would not enable (kernel suspects the cable)"),
+    (re.compile(r"^hub (?P<bus>\S+?):[\d.]+: hub_ext_port_status failed "
+                r"\(err = (?P<err>-?\d+)\)"),
+     store.KIND_ERROR, "hub stopped answering port status (error {err})"),
+    (re.compile(r"^hub (?P<bus>\S+?):[\d.]+: activate --> (?P<err>-?\d+)"),
+     store.KIND_ERROR, "hub failed to activate (error {err})"),
 ]
 
 
@@ -107,7 +130,9 @@ class KernelLog:
                     continue
                 fields = hit.groupdict()
                 busid = fields.get("bus") or ""
-                if not busid and "hub" in fields:
+                if not busid and fields.get("pci"):
+                    busid = f"pci:{fields['pci']}"
+                elif not busid and "hub" in fields:
                     # "usb usb3-port4" style: the port names a child of the root hub.
                     busid = f"{fields['hub']}-{fields['port']}"
                 elif busid and "port" in fields and kind == store.KIND_OVERCURRENT:
