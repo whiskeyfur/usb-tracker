@@ -301,6 +301,30 @@ class Store:
         args.append(limit)
         return [tuple(r) for r in self.db.execute(sql, args).fetchall()]
 
+    def load_before(self, key: str, ts: float, lookback: float = 60.0
+                    ) -> tuple[float | None, float | None]:
+        """(last, peak) downstream draw for a device in the window before ts.
+
+        Used to say what a hub was carrying when it dropped, which is the
+        difference between a brown-out and a coincidence.
+        """
+        row = self.db.execute(
+            """SELECT subtree_ma FROM samples WHERE key=? AND ts<=?
+               ORDER BY ts DESC LIMIT 1""", (key, ts)).fetchone()
+        last = row["subtree_ma"] if row else None
+        row = self.db.execute(
+            """SELECT MAX(subtree_ma) peak FROM samples
+               WHERE key=? AND ts BETWEEN ? AND ?""",
+            (key, ts - lookback, ts)).fetchone()
+        peak = row["peak"] if row and row["peak"] is not None else None
+        return (last, peak)
+
+    def key_for_busid(self, busid: str) -> str:
+        row = self.db.execute(
+            "SELECT key FROM devices WHERE busid=? ORDER BY last_seen DESC LIMIT 1",
+            (busid,)).fetchone()
+        return row["key"] if row else ""
+
     def event_counts(self, key: str) -> dict[str, int]:
         cur = self.db.execute(
             "SELECT kind, COUNT(*) n FROM events WHERE key=? GROUP BY kind", (key,))

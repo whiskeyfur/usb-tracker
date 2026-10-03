@@ -77,7 +77,27 @@ def collect(backfill_seconds: float = 30 * 86400) -> tuple[list[Burst], bool, st
     return ([b for b in bursts if len(b.devices) >= MIN_DEVICES], True, "")
 
 
-def report(bursts: list[Burst], boot_cutoff: float | None = None) -> list[str]:
+def _load_note(db, scope: str | None, when: float) -> str:
+    """Pull the recorded downstream draw for a burst, if the database has it."""
+    if db is None or not scope:
+        return ""
+    try:
+        key = db.key_for_busid(scope)
+        if not key:
+            return ""
+        last, peak = db.load_before(key, when)
+    except Exception:
+        return ""
+    if last is None or last <= 0:
+        return ""
+    note = f" carrying {last:.0f} mA downstream"
+    if peak is not None and peak > last * 1.15:
+        note += f" (peak {peak:.0f} mA)"
+    return note
+
+
+def report(bursts: list[Burst], boot_cutoff: float | None = None,
+           db=None) -> list[str]:
     """Human-readable findings, as lines."""
     out: list[str] = []
     if not bursts:
@@ -99,7 +119,8 @@ def report(bursts: list[Burst], boot_cutoff: float | None = None) -> list[str]:
                  else "everything behind it dropped" if burst.scope
                  else "spanned controllers -- system-wide")
         out.append(f"  {when}  {len(burst.devices):2} devices, "
-                   f"{burst.span:.1f}s, under {scope} -- {shape}")
+                   f"{burst.span:.1f}s, under {scope} -- {shape}"
+                   + _load_note(db, burst.scope, burst.start))
         if burst.errors:
             for _ts, kind, detail in burst.errors[:3]:
                 out.append(f"      kernel said: {kind}: {detail}")

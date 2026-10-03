@@ -373,8 +373,9 @@ class Monitor:
             "busids": list(dict.fromkeys(busids)),
             "scope": scope,
         }
-        st.add_event(now, "", store.KIND_OUTAGE,
-                     self._describe_outage(len(keys), scope, busids))
+        detail = self._describe_outage(len(keys), scope, busids)
+        detail += self._load_clause(st, scope, self._outage["start"])
+        st.add_event(now, "", store.KIND_OUTAGE, detail)
 
     def _describe_outage(self, count: int, scope: str | None,
                          busids: list[str]) -> str:
@@ -391,6 +392,27 @@ class Monitor:
             return (f"{count} devices went away with the hub at {named} -- "
                     f"the hub dropped first and took everything behind it")
         return f"{count} devices behind {named} went away together"
+
+    def _load_clause(self, st: Store, scope: str | None, when: float) -> str:
+        """What the hub was carrying just before it went, if we sampled it."""
+        if not scope:
+            return ""
+        key = self._key_for_busid(scope) or st.key_for_busid(scope)
+        if not key:
+            return ""
+        last, peak = st.load_before(key, when)
+        if last is None or last <= 0:
+            return ""
+        clause = f", carrying {last:.0f} mA downstream at the time"
+        if peak is not None and peak > last * 1.15:
+            clause += f" (peaking at {peak:.0f} mA in the preceding minute)"
+        return clause
+
+    def _key_for_busid(self, busid: str) -> str:
+        for key, dev in self._prev.items():
+            if dev.busid == busid:
+                return key
+        return ""
 
     def _label_for_busid(self, busid: str) -> str:
         for dev in self._prev.values():

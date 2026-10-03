@@ -318,6 +318,49 @@ class OutageTests(unittest.TestCase):
         self.assertIn("6 of 6 devices returned", details[0])
         self.assertIsNone(self.mon._outage)
 
+    def test_outage_records_what_the_hub_was_carrying(self):
+        """The brown-out question: how much load was on it when it went?"""
+        self.world = self.tree()
+        self.mon.tick()
+        self.mon.tick()                       # a sample to look back at
+        for busid in ("3-4", "3-4.1", "3-4.1.1", "3-4.1.2", "3-4.1.3", "3-4.1.4"):
+            self.world.pop(busid)
+        self.mon.tick()
+        detail = self.outage_details()[0]
+        self.assertIn("carrying", detail)
+        self.assertIn("mA downstream at the time", detail)
+        # the hub plus four leaves, at the 100 mA each the helper declares
+        self.assertIn("600 mA", detail)
+
+    def test_outage_notes_a_peak_higher_than_the_last_sample(self):
+        self.world = self.tree()
+        self.mon.tick()
+        for n in range(1, 5):                  # a heavy moment, then calm
+            self.world[f"3-4.1.{n}"] = device(f"3-4.1.{n}", serial=f"LEAF{n}",
+                                              power=500)
+        self.mon.tick()
+        for n in range(1, 5):
+            self.world[f"3-4.1.{n}"] = device(f"3-4.1.{n}", serial=f"LEAF{n}",
+                                              power=100)
+        self.mon.tick()
+        for busid in ("3-4", "3-4.1", "3-4.1.1", "3-4.1.2", "3-4.1.3", "3-4.1.4"):
+            self.world.pop(busid)
+        self.mon.tick()
+        detail = self.outage_details()[0]
+        self.assertIn("peaking at", detail)
+        self.assertIn("2200 mA", detail)
+
+    def test_outage_without_samples_omits_the_load(self):
+        self.world = self.tree()
+        self.mon.tick()
+        for busid in ("3-4.1.1", "3-4.1.2", "3-4.1.3"):
+            self.world.pop(busid)
+        # no sample exists for the ancestor that survived? it does -- but a
+        # scope with no recorded samples must not invent a figure
+        self.mon._key_for_busid = lambda _b: "nonexistent"
+        self.mon.tick()
+        self.assertNotIn("carrying", self.outage_details()[0])
+
     def test_a_single_unplug_is_not_an_outage(self):
         self.world = self.tree()
         self.mon.tick()

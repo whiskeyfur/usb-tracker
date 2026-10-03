@@ -121,8 +121,16 @@ def cmd_analyze(args) -> int:
         return 1
     # Skip the first 60 seconds of uptime: that is the machine booting.
     boot = boot_time()
-    for line in analyze.report(bursts, boot_cutoff=boot + 60 if boot else None):
+    db = None
+    try:
+        db = store.Store(args.db)
+    except Exception:
+        pass            # no history yet is fine; the kernel log stands alone
+    for line in analyze.report(bursts, boot_cutoff=boot + 60 if boot else None,
+                               db=db):
         print(line)
+    if db is not None:
+        db.close()
     return 0
 
 

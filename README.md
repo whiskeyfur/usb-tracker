@@ -74,6 +74,22 @@ event naming it — plus a second when they come back, with how long it took. A
 red banner appears in the window, and **Outage report** in the menu lists what
 has been seen.
 
+Each outage also records **what that hub was carrying when it went**, taken
+from the samples already on disk:
+
+```
+14 devices went away with the hub at 3-4 (USB2.1 Hub) -- the hub dropped
+first and took everything behind it, carrying 2410 mA downstream at the time
+(peaking at 2908 mA in the preceding minute)
+```
+
+That line is the difference between a theory and a finding. A self-powered hub
+that drops while carrying close to its adapter's rating is browning out; one
+that drops at idle is not, and the cable or the port is the better suspect.
+The peak covers the preceding minute, because the spike that trips it — a
+camera waking, a drive spinning up — usually lands a moment before the drop
+rather than exactly on it.
+
 The shape of the drop tells you where the fault is:
 
 | What the log shows | What it means |
@@ -94,7 +110,9 @@ python3 -m usbtracker --analyze
 ```
 
 It groups the log into disturbances, reports what each one had in common, and
-says so plainly when every one of them points at the same hub.
+says so plainly when every one of them points at the same hub. Where the
+database already holds samples covering one of those moments, the recorded
+downstream draw is shown alongside it.
 
 ### Catching the next one
 
@@ -168,7 +186,7 @@ and URB rate and does not pretend to know the byte count.
 | `suspend` / `resume` | Runtime power management parked or woke the device. |
 | `config` | Power budget, configuration or link speed changed. |
 | `bandwidth` | The device's reserved periodic bandwidth changed — typically a camera or audio interface switching alternate setting as a stream starts or stops. |
-| `outage` | Several devices dropped together, attributed to what they share; a second one records the recovery and its duration. |
+| `outage` | Several devices dropped together, attributed to what they share, with the downstream draw at that moment; a second one records the recovery and its duration. |
 | `controller` | The host controller itself reported trouble (`xHCI host controller not responding`, `HC died`, reset or halt failures). |
 | `stall` | The tracker went unscheduled for far longer than its interval — the machine was busy, asleep, or stopped. Events in that window may be missing. |
 | `driver` | A kernel driver bound to or released an interface. |
