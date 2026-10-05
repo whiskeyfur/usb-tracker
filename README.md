@@ -18,7 +18,11 @@ and names what they had in common.
   **Power** and **Bandwidth** — with the declared figure, optional downstream
   total, shaded bands for the stretches it was missing, and markers for drops,
   returns and resets.
-- **Bottom right:** that device's event log.
+- **Overview:** the button above the graph swaps it for a Sankey diagram of
+  the whole system, described [below](#overview).
+- **Bottom right:** that device's event log. For a hub, an **Allocation**
+  page sits beside it: every device behind the hub with its power and
+  bandwidth share.
 
 Right-click a device to allow or prevent autosuspend, copy a udev rule to make
 that stick, or export its history.
@@ -173,6 +177,65 @@ byte accounting needs `usbmon`, which lives in debugfs and requires root; this
 app does not ask for root, so for those devices it shows reserved bandwidth
 and URB rate and does not pretend to know the byte count.
 
+## Hub allocation
+
+Select a hub and the bottom right pane opens on **Allocation**, a table of
+every device behind that hub, nested hubs included, with what each one takes:
+
+![allocation](docs/allocation.png)
+
+| Column | What it is |
+| --- | --- |
+| **Budget / Draw** | The device's own declared bMaxPower and estimated draw, as in the tree. |
+| **On port** | What the device puts on the hub's port, against what that port guarantees. A bus-powered hub carries everything behind it, so its figure includes its downstream. |
+| **Share** | That load as a share of the hub's total supply. |
+| **Reserved / Of link** | Periodic bandwidth reserved, and its share of what the hub's link allows for periodic transfers. |
+| **Measured** | Real throughput, where the kernel counts bytes. |
+
+Above the table, two bars show how much of the hub's power and bandwidth is
+spoken for. They turn amber past 80% and red once the hub is over-committed,
+and any port carrying more than it guarantees is listed and shown in red.
+Devices that have gone stay in the table as shadows with their last declared
+budget, but they do not count towards the totals. Double-click a row to jump
+to that device in the tree.
+
+**The supply figures are the USB spec's guarantees, not measurements.** A hub
+cannot report what its adapter can really deliver, so supply means:
+
+| Hub | Per port | Hub total |
+| --- | --- | --- |
+| Root hub or self-powered hub | 500 mA (USB 2), 900 mA (USB 3) | per-port figure × ports |
+| Bus-powered hub | 100 mA (USB 2), 150 mA (USB 3) | its upstream port's 500/900 mA, less its own budget |
+
+The port's allowance follows the speed the device connected at, so a USB 2
+device on a USB 3 hub is held to the USB 2 figure. Periodic bandwidth is
+capped at 80% of the link at USB 2 speeds and 90% at USB 3. A USB 3 hub shows
+up as two hubs, one per speed, sharing the same physical ports and adapter, so
+read the two tables together.
+
+## Overview
+
+**Overview**, above the graph, swaps the graph for a Sankey diagram of every
+bus at once. Controllers are on the left, each hub and device sits in the
+column for its depth, and every ribbon is as wide as what that branch takes.
+The **Power** and **Bandwidth** buttons switch the flow between declared
+power and reserved bandwidth.
+
+![overview](docs/overview.png)
+
+Colour shows health, so a bad branch stands out before you read a number:
+
+| Colour | Meaning |
+| --- | --- |
+| Green | Healthy |
+| Amber | Runtime-suspended |
+| Orange | Over budget: more on a port than it guarantees, or a hub over-committed |
+| Red | Over-current trips or bus errors logged |
+| Grey outline | Lost; follows the **Lost** button |
+
+Hover over a node to highlight its branch and see the figures and reasons.
+Click a node to open that device's own graph and history.
+
 ## What gets recorded
 
 | Event | Meaning |
@@ -264,6 +327,8 @@ usbtracker/
   kmsg.py      scrapes dmesg for resets, over-current, enumeration failures
                and host-controller faults
   analyze.py   groups the kernel log into outages and reports the common cause
+  allocation.py  per-hub power and bandwidth allocation, from a snapshot
+  overview.py  the Sankey overview: flow, health and layout
   monitor.py   diffs successive snapshots into events and samples
   store.py     SQLite: device roster, event log, power samples
   power.py     reads and changes power/control, via polkit when needed
