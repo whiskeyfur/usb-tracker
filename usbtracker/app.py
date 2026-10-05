@@ -13,6 +13,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 from . import power, store  # noqa: E402
+from .allocation import HubAllocation, hub_allocation  # noqa: E402
 from .monitor import Monitor, Snapshot  # noqa: E402
 
 APP_ID = "dev.local.usbtracker"
@@ -20,6 +21,13 @@ APP_ID = "dev.local.usbtracker"
 # Tree model columns.
 C_KEY, C_NAME, C_DRAW, C_BUDGET, C_TRAFFIC, C_STATUS, C_DROPS, C_DOT, \
     C_DOTCOLOR, C_FG, C_FGSET, C_STYLE, C_WEIGHT = range(13)
+
+# Allocation table columns.
+A_KEY, A_NAME, A_PORT, A_BUDGET, A_DRAW, A_ONPORT, A_SHARE, A_RESERVED, \
+    A_BWSHARE, A_MEASURED, A_FG, A_FGSET, A_STYLE, A_TIP = range(14)
+
+VIEW_ALLOCATION = "allocation"
+VIEW_HISTORY = "history"
 
 RANGES: list[tuple[str, float]] = [
     ("5 min", 300), ("15 min", 900), ("1 hour", 3600),
@@ -66,6 +74,11 @@ CSS = b"""
 .pane-head { padding: 6px 10px; }
 .card-head { border-bottom: 1px solid alpha(currentColor, 0.12); }
 .readout { font-family: monospace; font-size: 0.92rem; }
+.warn { color: #e01b24; }
+levelbar block.ok { background-color: #3584e4; }
+levelbar block.tight { background-color: #e5a50a; }
+levelbar.over block.filled { background-color: #e01b24; }
+.summary { padding: 6px 10px 2px 10px; }
 .banner {
     background: alpha(#e01b24, 0.13);
     border-bottom: 1px solid alpha(#e01b24, 0.35);
@@ -112,6 +125,13 @@ def fmt_ago(ts: float, now: float | None = None) -> str:
     if delta < 86400:
         return f"{delta / 3600:.1f}h ago"
     return f"{delta / 86400:.1f}d ago"
+
+
+def fmt_pct(fraction: float) -> str:
+    if fraction <= 0:
+        return "–"
+    pct = fraction * 100
+    return f"{pct:.1f}%" if pct < 10 else f"{pct:.0f}%"
 
 
 def nice_ceiling(value: float) -> float:
@@ -709,7 +729,23 @@ class TrackerWindow(Gtk.ApplicationWindow):
                                            tooltip_text="Show events from every device")
         self.all_events.connect("toggled", lambda *_: self._refresh_history())
         hhead.append(self.all_events)
+
+        # Hubs get a second page: what everything behind them is allocated.
+        self.view_switcher = Gtk.Box(css_classes=["linked"], valign=Gtk.Align.CENTER)
+        self.view_buttons: dict[str, Gtk.ToggleButton] = {}
+        for view, label in ((VIEW_ALLOCATION, "Allocation"),
+                            (VIEW_HISTORY, "History")):
+            button = Gtk.ToggleButton(label=label, active=view == VIEW_ALLOCATION)
+            button.connect("toggled", self._on_view, view)
+            self.view_switcher.append(button)
+            self.view_buttons[view] = button
+        self.view_switcher.set_visible(False)
+        hhead.append(self.view_switcher)
+        self.hub_view = VIEW_ALLOCATION
         bottom.append(hhead)
+
+        self.bottom_stack = Gtk.Stack(vexpand=True)
+        self.bottom_stack.add_named(self._build_allocation_page(), VIEW_ALLOCATION)
 
         self.events_model = Gtk.ListStore(str, str, str, str, bool)
         self.events_view = Gtk.TreeView(model=self.events_model)
@@ -728,9 +764,92 @@ class TrackerWindow(Gtk.ApplicationWindow):
             self.events_view.append_column(col)
         scroller = Gtk.ScrolledWindow(vexpand=True)
         scroller.set_child(self.events_view)
-        bottom.append(scroller)
+        self.bottom_stack.add_named(scroller, VIEW_HISTORY)
+        self.bottom_stack.set_visible_child_name(VIEW_HISTORY)
+        bottom.append(self.bottom_stack)
         pane.set_end_child(bottom)
         return pane
+
+    def _build_allocation_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        self.alloc_summary = Gtk.Label(xalign=0.0, wrap=True, selectable=True)
+        self.alloc_summary.add_css_class("summary")
+        page.append(self.alloc_summary)
+
+        meters = Gtk.Grid(column_spacing=10, row_spacing=4)
+        meters.add_css_class("summary")
+        self.power_meter = Gtk.LevelBar(min_value=0.0, max_value=1.0, hexpand=True,
+                                        valign=Gtk.Align.CENTER)
+        self.bw_meter = Gtk.LevelBar(min_value=0.0, max_value=1.0, hexpand=True,
+                                     valign=Gtk.Align.CENTER)
+        self.power_meter_label = Gtk.Label(xalign=0.0, css_classes=["readout"])
+        self.bw_meter_label = Gtk.Label(xalign=0.0, css_classes=["readout"])
+        for row, (title, meter, label) in enumerate(
+                (("Power", self.power_meter, self.power_meter_label),
+                 ("Bandwidth", self.bw_meter, self.bw_meter_label))):
+            # The stock offsets read "full" as good, like a battery; here a
+            # full bar is a hub with nothing left to give.
+            for offset in (Gtk.LEVEL_BAR_OFFSET_LOW, Gtk.LEVEL_BAR_OFFSET_HIGH,
+                           Gtk.LEVEL_BAR_OFFSET_FULL):
+                meter.remove_offset_value(offset)
+            meter.add_offset_value("ok", 0.8)
+            meter.add_offset_value("tight", 1.0)
+            name = Gtk.Label(label=title, xalign=0.0, css_classes=["dim"])
+            name.set_size_request(76, -1)
+            meters.attach(name, 0, row, 1, 1)
+            meters.attach(meter, 1, row, 1, 1)
+            meters.attach(label, 2, row, 1, 1)
+        page.append(meters)
+
+        self.alloc_warning = Gtk.Label(xalign=0.0, wrap=True, visible=False)
+        self.alloc_warning.add_css_class("summary")
+        self.alloc_warning.add_css_class("warn")
+        page.append(self.alloc_warning)
+
+        self.alloc_model = Gtk.TreeStore(str, str, str, str, str, str, str, str,
+                                         str, str, str, bool, int, str)
+        self.alloc_view = Gtk.TreeView(model=self.alloc_model, enable_tree_lines=True)
+        self.alloc_view.set_tooltip_column(A_TIP)
+        self.alloc_view.connect("row-activated", self._on_alloc_activated)
+
+        name = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+        col = Gtk.TreeViewColumn("Device", name, markup=A_NAME, foreground=A_FG,
+                                 style=A_STYLE)
+        col.add_attribute(name, "foreground-set", A_FGSET)
+        col.set_expand(True)
+        col.set_min_width(140)
+        self.alloc_view.append_column(col)
+        self.alloc_view.set_expander_column(col)
+
+        for title, column, width, tip in (
+                ("Port", A_PORT, 66, ""),
+                ("Budget", A_BUDGET, 58, "Declared bMaxPower, mA"),
+                ("Draw", A_DRAW, 50, "Estimated draw, mA"),
+                ("On port", A_ONPORT, 76,
+                 "Declared load on the hub port against what the port guarantees; "
+                 "a bus-powered hub carries its downstream too"),
+                ("Share", A_SHARE, 50, "Share of the hub's spec supply"),
+                ("Reserved", A_RESERVED, 70, "Reserved periodic bandwidth"),
+                ("Of link", A_BWSHARE, 56,
+                 "Share of the periodic bandwidth the hub's link allows"),
+                ("Measured", A_MEASURED, 72, "Measured throughput, where counted")):
+            renderer = Gtk.CellRendererText(xalign=0.0 if column == A_PORT else 1.0,
+                                            family="monospace")
+            col = Gtk.TreeViewColumn(title, renderer, text=column, foreground=A_FG,
+                                     style=A_STYLE)
+            col.add_attribute(renderer, "foreground-set", A_FGSET)
+            col.set_fixed_width(width)
+            col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+            self.alloc_view.append_column(col)
+            if tip:
+                header = Gtk.Label(label=title, tooltip_text=tip)
+                col.set_widget(header)
+
+        scroller = Gtk.ScrolledWindow(vexpand=True)
+        scroller.set_child(self.alloc_view)
+        page.append(scroller)
+        return page
 
     def _swatch(self, rgb, label: str) -> Gtk.Widget:
         box = Gtk.Box(spacing=6)
@@ -761,6 +880,7 @@ class TrackerWindow(Gtk.ApplicationWindow):
         self._refill_tree()
         self._refresh_graph()
         self._refresh_history()
+        self._refresh_allocation()
         self._update_header()
         self._update_banner()
         return False
@@ -1067,6 +1187,7 @@ class TrackerWindow(Gtk.ApplicationWindow):
         self._refresh_detail_header()
         self._refresh_graph()
         self._refresh_history()
+        self._refresh_allocation()
 
     # ---- right-hand side ------------------------------------------------
 
@@ -1208,6 +1329,150 @@ class TrackerWindow(Gtk.ApplicationWindow):
             self.history_label.set_label(f"History · {name} ({len(rows)})")
         else:
             self.history_label.set_label("History")
+
+    # ---- hub allocation -------------------------------------------------
+
+    def _on_view(self, button, view):
+        if not button.get_active():
+            if not any(b.get_active() for b in self.view_buttons.values()):
+                button.set_active(True)
+            return
+        for name, other in self.view_buttons.items():
+            if name != view and other.get_active():
+                other.set_active(False)
+        self.hub_view = view
+        self._refresh_history()
+        self._refresh_allocation()
+
+    def _refresh_allocation(self):
+        alloc = (hub_allocation(self.snapshot, self.selected_key)
+                 if self.selected_key else None)
+        self.view_switcher.set_visible(alloc is not None)
+        view = self.hub_view if alloc is not None else VIEW_HISTORY
+        self.bottom_stack.set_visible_child_name(view)
+        self.all_events.set_visible(view == VIEW_HISTORY)
+        if view == VIEW_HISTORY:
+            return
+        self.history_label.set_label(f"Allocation · {alloc.label}")
+        self._fill_allocation(alloc)
+
+    def _fill_allocation(self, alloc: HubAllocation):
+        kind = ("Root hub" if alloc.root else
+                "Self-powered hub" if alloc.self_powered else "Bus-powered hub")
+        bits = [kind,
+                f"{alloc.used_ports} of {alloc.ports} ports in use",
+                f"supply {fmt_ma(alloc.supply_ma)} by spec",
+                f"declared {fmt_ma(alloc.declared_ma)}",
+                f"estimated {fmt_ma(alloc.est_ma)}"]
+        if alloc.supply_ma > 0:
+            bits.append(f"headroom {alloc.headroom_ma:.0f} mA")
+        bw = [f"{fmt_bps(alloc.reserved_bps)} reserved of "
+              f"{fmt_bps(alloc.periodic_bps)} periodic"]
+        if alloc.measured_bps:
+            bw.append(f"{fmt_bps(alloc.measured_bps)} measured")
+        bw.append(f"link {fmt_bps(alloc.link_bps)}")
+        self.alloc_summary.set_label("  ·  ".join(bits) + "\n" + "  ·  ".join(bw))
+
+        power_share = alloc.share(alloc.declared_ma)
+        bw_share = alloc.bw_share(alloc.reserved_bps)
+        for meter, share in ((self.power_meter, power_share),
+                             (self.bw_meter, bw_share)):
+            meter.set_value(min(1.0, share))
+            if share > 1.0:
+                meter.add_css_class("over")
+            else:
+                meter.remove_css_class("over")
+        self.power_meter_label.set_label(
+            f"{fmt_pct(power_share)} declared, "
+            f"{fmt_pct(alloc.share(alloc.est_ma))} estimated")
+        self.bw_meter_label.set_label(f"{fmt_pct(bw_share)} reserved")
+
+        warnings = []
+        if alloc.overcommitted:
+            warnings.append(
+                f"Over-committed: devices on its ports declare "
+                f"{alloc.declared_ma:.0f} mA against {alloc.supply_ma:.0f} mA "
+                f"the spec guarantees.")
+        for row in alloc.over_ports:
+            warnings.append(
+                f"{row.label} on {row.busid} puts {row.port_budget_ma:.0f} mA on "
+                f"a port that guarantees {row.allowance_ma:.0f} mA.")
+        if alloc.periodic_bps and alloc.reserved_bps > alloc.periodic_bps:
+            warnings.append("Reserved bandwidth exceeds what the link allows for "
+                            "periodic transfers; a new stream will be refused.")
+        self.alloc_warning.set_label("\n".join(warnings))
+        self.alloc_warning.set_visible(bool(warnings))
+
+        self.alloc_model.clear()
+        parents: dict[str, Gtk.TreeIter] = {}
+        for row in alloc.rows:
+            parent = parents.get(row.parent_key or "")
+            it = self.alloc_model.append(parent, self._alloc_row(alloc, row))
+            parents[row.key] = it
+        self.alloc_view.expand_all()
+        if not alloc.rows:
+            self.alloc_model.append(None, ["", "<i>Nothing connected behind this hub</i>",
+                                           "", "", "", "", "", "", "", "",
+                                           GHOST_FG, True, int(Pango.Style.NORMAL), ""])
+
+    def _alloc_row(self, alloc: HubAllocation, row) -> list:
+        name = GLib.markup_escape_text(row.label)
+        tags = []
+        if row.is_hub:
+            tags.append("self-powered hub" if row.self_powered else "bus-powered hub")
+        if not row.present:
+            tags.append("lost")
+        if tags:
+            name += f"  <span size='small' alpha='55%'>{', '.join(tags)}</span>"
+        port = row.busid
+
+        if row.present:
+            budget = f"{row.budget_ma:.0f}" if row.budget_ma else "–"
+            draw = ("–" if row.est_ma <= 0 else
+                    f"{row.est_ma:.0f}" if row.est_ma >= 10 else f"{row.est_ma:.1f}")
+            reserved = fmt_bps(row.alloc_bps, "compact") if row.alloc_bps else "–"
+            bwshare = fmt_pct(alloc.bw_share(row.alloc_bps))
+            measured = (fmt_bps(row.measured_bps, "compact") if row.measured
+                        else "–")
+        else:
+            # remembered budget, nothing current
+            budget = f"({row.budget_ma:.0f})" if row.budget_ma else "–"
+            draw = reserved = bwshare = measured = "–"
+
+        if row.depth == 1 and row.present:
+            onport = f"{row.port_budget_ma:.0f}/{row.allowance_ma:.0f}"
+            share = fmt_pct(alloc.share(row.port_budget_ma))
+        else:
+            onport = share = ""
+
+        if not row.present:
+            fg, fgset, style = GHOST_FG, True, int(Pango.Style.ITALIC)
+        elif row.over_port:
+            fg, fgset, style = DOT_FAULT, True, int(Pango.Style.NORMAL)
+        else:
+            fg, fgset, style = GHOST_FG, False, int(Pango.Style.NORMAL)
+
+        tip = f"{row.label}  ·  {row.busid}"
+        if row.depth == 1 and row.present:
+            tip += (f"\n{row.port_budget_ma:.0f} mA declared on this port, "
+                    f"{row.port_est_ma:.0f} mA estimated; the port guarantees "
+                    f"{row.allowance_ma:.0f} mA")
+            if row.is_hub and not row.self_powered:
+                tip += "\nbus-powered hub: includes everything behind it"
+        elif not row.present:
+            tip += "\nnot connected; budget shown is the last one declared"
+        return [row.key, name, port, budget, draw, onport, share, reserved,
+                bwshare, measured, fg, fgset, style, GLib.markup_escape_text(tip)]
+
+    def _on_alloc_activated(self, _view, path, _column):
+        key = self.alloc_model.get_value(self.alloc_model.get_iter(path), A_KEY)
+        it = self.iters.get(key)
+        if it is None:
+            return
+        tree_path = self.model.get_path(it)
+        self.tree.expand_to_path(tree_path)
+        self.tree.get_selection().select_path(tree_path)
+        self.tree.scroll_to_cell(tree_path, None, False, 0.0, 0.0)
 
     # ---- actions --------------------------------------------------------
 

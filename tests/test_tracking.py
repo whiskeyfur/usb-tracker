@@ -12,6 +12,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from usbtracker import power, store, sysfs               # noqa: E402
+from usbtracker.allocation import hub_allocation          # noqa: E402
 from usbtracker.app import fmt_bps, fmt_ma, nice_ceiling  # noqa: E402
 from usbtracker.monitor import Monitor                   # noqa: E402
 from usbtracker.store import Store                       # noqa: E402
@@ -407,6 +408,113 @@ class OutageTests(unittest.TestCase):
         self.mon.tick()
         kinds = [e[2] for e in self.store.events("")]
         self.assertNotIn(store.KIND_STALL, kinds)
+
+
+class AllocationTests(unittest.TestCase):
+    """The per-hub table: who is on which port, against what the port gives."""
+
+    def setUp(self):
+        self.world: dict[str, UsbDevice] = {}
+        self.mon = Monitor(db_path=":memory:", interval=1.0, use_kmsg=False,
+                           scan_fn=lambda: dict(self.world))
+        self.mon._store = Store(":memory:")
+        self.mon._rows = {}
+
+    def hub(self, busid, serial, *, power=100, self_powered=False, ports=4,
+            speed=480.0):
+        dev = device(busid, serial=serial, power=power, product=f"Hub {serial}",
+                     dev_class=0x09)
+        dev.self_powered = self_powered
+        dev.max_children = ports
+        dev.speed_mbps = speed
+        return dev
+
+    def test_self_powered_hub_supply_and_shares(self):
+        root = self.hub("usb3", "", power=0, ports=2)
+        hub = self.hub("3-1", "HUB", power=0, self_powered=True, ports=4)
+        cam = device("3-1.1", serial="CAM", power=500,
+                     endpoints=[endpoint(kind="Isoc", packet=1024,
+                                         interval_us=125.0)])
+        kbd = device("3-1.2", serial="KBD", power=100)
+        self.world = {d.busid: d for d in (root, hub, cam, kbd)}
+        snap = self.mon.tick()
+
+        alloc = hub_allocation(snap, hub.key)
+        self.assertEqual(alloc.ports, 4)
+        self.assertEqual(alloc.used_ports, 2)
+        self.assertAlmostEqual(alloc.supply_ma, 2000.0)   # 4 x 500 mA
+        self.assertAlmostEqual(alloc.declared_ma, 600.0)
+        self.assertAlmostEqual(alloc.share(600.0), 0.30)
+        self.assertFalse(alloc.overcommitted)
+        self.assertEqual(alloc.over_ports, [])
+        # 1024 bytes every 125 us
+        self.assertAlmostEqual(alloc.reserved_bps, 1024 * 8000)
+        self.assertAlmostEqual(alloc.periodic_bps, 480e6 / 8 * 0.8)
+        self.assertEqual([r.label for r in alloc.rows], ["Widget", "Widget"])
+
+    def test_bus_powered_hub_is_overcommitted_by_a_hungry_device(self):
+        root = self.hub("usb3", "", power=0, ports=2)
+        hub = self.hub("3-1", "HUB", power=100, self_powered=False)
+        drive = device("3-1.1", serial="HDD", power=500)
+        self.world = {d.busid: d for d in (root, hub, drive)}
+        snap = self.mon.tick()
+
+        alloc = hub_allocation(snap, hub.key)
+        self.assertAlmostEqual(alloc.supply_ma, 400.0)    # 500 upstream - 100 own
+        self.assertTrue(alloc.overcommitted)
+        (row,) = alloc.over_ports
+        self.assertEqual(row.allowance_ma, 100.0)          # bus-powered USB 2 port
+
+    def test_bus_powered_child_hub_carries_its_downstream_on_the_port(self):
+        root = self.hub("usb3", "", power=0, ports=2)
+        top = self.hub("3-1", "TOP", power=0, self_powered=True)
+        inner = self.hub("3-1.1", "INNER", power=100, self_powered=False)
+        leaf = device("3-1.1.1", serial="LEAF", power=200)
+        self.world = {d.busid: d for d in (root, top, inner, leaf)}
+        snap = self.mon.tick()
+
+        alloc = hub_allocation(snap, top.key)
+        first, nested = alloc.rows
+        self.assertEqual((first.depth, nested.depth), (1, 2))
+        self.assertAlmostEqual(first.port_budget_ma, 300.0)
+        self.assertAlmostEqual(alloc.declared_ma, 300.0)
+        self.assertEqual(nested.port_budget_ma, 0.0)
+
+    def test_lost_devices_stay_listed_but_do_not_count(self):
+        root = self.hub("usb3", "", power=0, ports=2)
+        hub = self.hub("3-1", "HUB", power=0, self_powered=True)
+        stick = device("3-1.3", serial="SN1", power=200)
+        self.world = {d.busid: d for d in (root, hub, stick)}
+        self.mon.tick()
+        del self.world["3-1.3"]
+        snap = self.mon.tick()
+
+        alloc = hub_allocation(snap, hub.key)
+        (row,) = alloc.rows
+        self.assertFalse(row.present)
+        self.assertAlmostEqual(row.budget_ma, 200.0)      # remembered
+        self.assertEqual(alloc.declared_ma, 0.0)
+        self.assertEqual(alloc.used_ports, 0)
+
+    def test_superspeed_ports_get_the_usb3_allowance(self):
+        root = self.hub("usb4", "", power=0, ports=2, speed=5000.0)
+        ssd = device("4-1", serial="SSD", power=896)
+        ssd.speed_mbps = 5000.0
+        self.world = {d.busid: d for d in (root, ssd)}
+        snap = self.mon.tick()
+
+        alloc = hub_allocation(snap, root.key)
+        self.assertTrue(alloc.root)
+        self.assertAlmostEqual(alloc.supply_ma, 1800.0)
+        self.assertEqual(alloc.rows[0].allowance_ma, 900.0)
+        self.assertEqual(alloc.over_ports, [])
+
+    def test_not_a_hub(self):
+        root = self.hub("usb3", "", power=0, ports=2)
+        stick = device("3-1", serial="SN1")
+        self.world = {d.busid: d for d in (root, stick)}
+        snap = self.mon.tick()
+        self.assertIsNone(hub_allocation(snap, stick.key))
 
 
 class StoreTests(unittest.TestCase):
