@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from usbtracker import power, store, sysfs               # noqa: E402
+from usbtracker import overview, power, store, sysfs     # noqa: E402
 from usbtracker.allocation import hub_allocation          # noqa: E402
 from usbtracker.app import fmt_bps, fmt_ma, nice_ceiling  # noqa: E402
 from usbtracker.monitor import Monitor                   # noqa: E402
@@ -515,6 +515,82 @@ class AllocationTests(unittest.TestCase):
         self.world = {d.busid: d for d in (root, stick)}
         snap = self.mon.tick()
         self.assertIsNone(hub_allocation(snap, stick.key))
+
+
+class OverviewTests(unittest.TestCase):
+    """The Sankey overview: what flows where, and what colour it is."""
+
+    def setUp(self):
+        self.world: dict[str, UsbDevice] = {}
+        self.mon = Monitor(db_path=":memory:", interval=1.0, use_kmsg=False,
+                           scan_fn=lambda: dict(self.world))
+        self.mon._store = Store(":memory:")
+        self.mon._rows = {}
+
+    def build_world(self):
+        root = device("usb3", power=0, product="Root hub", dev_class=0x09)
+        root.max_children = 4
+        hub = device("3-1", serial="HUB", power=100, product="Hub", dev_class=0x09)
+        hub.max_children = 4
+        cam = device("3-1.1", serial="CAM", power=500, product="Camera",
+                     endpoints=[endpoint(packet=64, interval_us=1000.0)])
+        kbd = device("3-2", serial="KBD", power=100, product="Keyboard",
+                     status="suspended")
+        stick = device("3-3", serial="STK", power=200, product="Stick")
+        self.devs = {d.busid: d for d in (root, hub, cam, kbd, stick)}
+        self.world = dict(self.devs)
+        self.mon.tick()
+        del self.world["3-3"]
+        return self.mon.tick()
+
+    def test_values_sum_downstream(self):
+        snap = self.build_world()
+        flow = overview.build(snap)
+        root, hub = (flow.nodes[self.devs[b].key] for b in ("usb3", "3-1"))
+        self.assertAlmostEqual(hub.value, 600.0)
+        self.assertAlmostEqual(root.value, 700.0)
+        self.assertAlmostEqual(flow.total, 700.0)
+        bw = overview.build(snap, overview.METRIC_BANDWIDTH)
+        self.assertAlmostEqual(bw.total, 64000.0)
+
+    def test_health_colours(self):
+        flow = overview.build(self.build_world())
+        health = {b: flow.nodes[d.key].health for b, d in self.devs.items()}
+        self.assertEqual(health["3-2"], overview.HEALTH_SUSPENDED)
+        self.assertEqual(health["3-3"], overview.HEALTH_LOST)
+        # a bus-powered hub with a 500 mA camera on a 100 mA port
+        self.assertEqual(health["3-1"], overview.HEALTH_STRAINED)
+        self.assertEqual(health["3-1.1"], overview.HEALTH_STRAINED)
+        self.assertEqual(flow.counts[overview.HEALTH_LOST], 1)
+
+    def test_lost_can_be_left_out(self):
+        flow = overview.build(self.build_world(), include_lost=False)
+        self.assertNotIn(self.devs["3-3"].key, flow.nodes)
+
+    def test_layout_fits_and_ribbons_fill_their_parent(self):
+        flow = overview.build(self.build_world())
+        lay = overview.layout(flow, 600, 300)
+        self.assertEqual(lay.columns, 3)
+        for box in lay.boxes.values():
+            self.assertGreaterEqual(box.y, 0)
+            self.assertLessEqual(box.y + box.h, 300.5)
+        for key, node in flow.nodes.items():
+            if node.children:
+                fed = sum(r.width for r in lay.ribbons if r.parent == key)
+                self.assertLessEqual(fed, lay.boxes[key].h + 1e-6)
+        hub = self.devs["3-1"].key
+        box = lay.boxes[hub]
+        self.assertEqual(overview.hit(lay, box.x + 1, box.y + 1), hub)
+
+    def test_layout_survives_hundreds_of_devices(self):
+        root = device("usb3", power=0, product="Root hub", dev_class=0x09)
+        self.world = {"usb3": root}
+        for i in range(1, 201):
+            self.world[f"3-{i}"] = device(f"3-{i}", serial=f"S{i}", power=100)
+        flow = overview.build(self.mon.tick())
+        lay = overview.layout(flow, 600, 300)
+        bottom = max(b.y + b.h for b in lay.boxes.values())
+        self.assertLessEqual(bottom, 300.5)
 
 
 class StoreTests(unittest.TestCase):

@@ -18,6 +18,8 @@ and names what they had in common.
   **Power** and **Bandwidth** — with the declared figure, optional downstream
   total, shaded bands for the stretches it was missing, and markers for drops,
   returns and resets.
+- **Overview:** the button above the graph swaps it for a Sankey diagram of
+  the whole system, described [below](#overview).
 - **Bottom right:** that device's event log. For a hub, an **Allocation**
   page sits beside it: every device behind the hub with its power and
   bandwidth share.
@@ -211,6 +213,29 @@ capped at 80% of the link at USB 2 speeds and 90% at USB 3. A USB 3 hub shows
 up as two hubs, one per speed, sharing the same physical ports and adapter, so
 read the two tables together.
 
+## Overview
+
+**Overview**, above the graph, swaps the graph for a Sankey diagram of every
+bus at once. Controllers are on the left, each hub and device sits in the
+column for its depth, and every ribbon is as wide as what that branch takes.
+The **Power** and **Bandwidth** buttons switch the flow between declared
+power and reserved bandwidth.
+
+![overview](docs/overview.png)
+
+Colour shows health, so a bad branch stands out before you read a number:
+
+| Colour | Meaning |
+| --- | --- |
+| Green | Healthy |
+| Amber | Runtime-suspended |
+| Orange | Over budget: more on a port than it guarantees, or a hub over-committed |
+| Red | Over-current trips or bus errors logged |
+| Grey outline | Lost; follows the **Lost** button |
+
+Hover over a node to highlight its branch and see the figures and reasons.
+Click a node to open that device's own graph and history.
+
 ## What gets recorded
 
 | Event | Meaning |
@@ -303,6 +328,7 @@ usbtracker/
                and host-controller faults
   analyze.py   groups the kernel log into outages and reports the common cause
   allocation.py  per-hub power and bandwidth allocation, from a snapshot
+  overview.py  the Sankey overview: flow, health and layout
   monitor.py   diffs successive snapshots into events and samples
   store.py     SQLite: device roster, event log, power samples
   power.py     reads and changes power/control, via polkit when needed

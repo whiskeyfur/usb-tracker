@@ -12,7 +12,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
-from . import power, store  # noqa: E402
+from . import overview, power, store  # noqa: E402
 from .allocation import HubAllocation, hub_allocation  # noqa: E402
 from .monitor import Monitor, Snapshot  # noqa: E402
 
@@ -147,6 +147,21 @@ def nice_ceiling(value: float) -> float:
 
 
 COL_URB = (0.11, 0.60, 0.56)
+
+HEALTH_COLOURS = {
+    overview.HEALTH_OK: (0.18, 0.76, 0.49),
+    overview.HEALTH_SUSPENDED: (0.90, 0.65, 0.04),
+    overview.HEALTH_STRAINED: (0.90, 0.38, 0.00),
+    overview.HEALTH_FAULT: (0.88, 0.11, 0.14),
+    overview.HEALTH_LOST: (0.47, 0.46, 0.48),
+}
+HEALTH_LABELS = {
+    overview.HEALTH_OK: "Healthy",
+    overview.HEALTH_SUSPENDED: "Suspended",
+    overview.HEALTH_STRAINED: "Over budget",
+    overview.HEALTH_FAULT: "Faults logged",
+    overview.HEALTH_LOST: "Lost",
+}
 
 METRIC_POWER = "power"
 METRIC_BANDWIDTH = "bandwidth"
@@ -484,6 +499,167 @@ class HistoryGraph(Gtk.DrawingArea):
         return ticks
 
 
+class SankeyView(Gtk.DrawingArea):
+    """Power or bandwidth flowing from each controller out to its devices."""
+
+    def __init__(self):
+        super().__init__()
+        self.set_draw_func(self._draw)
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.flow: overview.Flow | None = None
+        self.layout: overview.Layout | None = None
+        self.hover: str | None = None
+        self.on_readout = None
+        self.on_pick = None
+
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_motion)
+        motion.connect("leave", self._on_leave)
+        self.add_controller(motion)
+        click = Gtk.GestureClick()
+        click.connect("released", self._on_click)
+        self.add_controller(click)
+
+    def set_flow(self, flow: overview.Flow) -> None:
+        self.flow = flow
+        if self.hover and self.hover not in flow.nodes:
+            self.hover = None
+        self.queue_draw()
+
+    def _fmt(self, value: float) -> str:
+        if self.flow and self.flow.metric == overview.METRIC_BANDWIDTH:
+            return fmt_bps(value)
+        return fmt_ma(value)
+
+    def _on_motion(self, _ctrl, x, y):
+        key = overview.hit(self.layout, x, y) if self.layout else None
+        if key != self.hover:
+            self.hover = key
+            self.queue_draw()
+            self.set_tooltip_text(self._describe(key).replace("  ·  ", "\n")
+                                  if key else None)
+            if self.on_readout:
+                self.on_readout(self._describe(key) if key else "")
+
+    def _on_leave(self, _ctrl):
+        self.hover = None
+        if self.on_readout:
+            self.on_readout("")
+        self.queue_draw()
+
+    def _on_click(self, _gesture, _n, x, y):
+        key = overview.hit(self.layout, x, y) if self.layout else None
+        if key and self.on_pick:
+            self.on_pick(key)
+
+    def _describe(self, key: str) -> str:
+        node = self.flow.nodes[key]
+        bits = [node.label]
+        if node.present:
+            bits.append(f"{self._fmt(node.value)}"
+                        + (f" incl. downstream ({self._fmt(node.own)} own)"
+                           if node.children and node.value > node.own else ""))
+        bits.extend(node.reasons)
+        return "  ·  ".join(bits)
+
+    def _related(self) -> set[str]:
+        """The hovered node, its ancestors and everything behind it."""
+        if not self.hover or not self.flow:
+            return set()
+        keep = {self.hover}
+        up = self.flow.nodes[self.hover].parent
+        while up:
+            keep.add(up)
+            up = self.flow.nodes[up].parent
+        stack = [self.hover]
+        while stack:
+            for child in self.flow.nodes[stack.pop()].children:
+                keep.add(child)
+                stack.append(child)
+        return keep
+
+    def _draw(self, _area, cr, width, height, _data=None):
+        try:
+            c = self.get_color()
+            fg = (c.red, c.green, c.blue)
+        except Exception:
+            fg = (0.5, 0.5, 0.5)
+        if not self.flow or not self.flow.nodes:
+            cr.select_font_face("Sans", 0, 0)
+            cr.set_font_size(12.5)
+            cr.set_source_rgba(*fg, 0.55)
+            msg = "No USB devices seen yet"
+            ext = cr.text_extents(msg)
+            cr.move_to((width - ext.width) / 2, height / 2)
+            cr.show_text(msg)
+            return
+
+        label_w = min(170.0, max(90.0, width * 0.2))
+        self.layout = lay = overview.layout(self.flow, width, height,
+                                            label_w=label_w)
+        related = self._related()
+
+        def dimmed(key: str) -> bool:
+            return bool(related) and key not in related
+
+        for rib in lay.ribbons:
+            child = self.flow.nodes[rib.child]
+            rgb = HEALTH_COLOURS[child.health]
+            alpha = 0.12 if child.health == overview.HEALTH_LOST else 0.32
+            if dimmed(rib.child):
+                alpha *= 0.35
+            elif related:
+                alpha = min(0.6, alpha * 1.6)
+            mid = (rib.x0 + rib.x1) / 2
+            cr.set_source_rgba(*rgb, alpha)
+            cr.move_to(rib.x0, rib.y0)
+            cr.curve_to(mid, rib.y0, mid, rib.y1, rib.x1, rib.y1)
+            cr.line_to(rib.x1, rib.y1 + rib.width)
+            cr.curve_to(mid, rib.y1 + rib.width, mid, rib.y0 + rib.width,
+                        rib.x0, rib.y0 + rib.width)
+            cr.close_path()
+            cr.fill()
+
+        step = None
+        xs = sorted({round(b.x) for b in lay.boxes.values()})
+        if len(xs) > 1:
+            step = xs[1] - xs[0]
+
+        for key, box in lay.boxes.items():
+            node = self.flow.nodes[key]
+            rgb = HEALTH_COLOURS[node.health]
+            alpha = 0.3 if dimmed(key) else 1.0
+            cr.set_source_rgba(*rgb, alpha)
+            if node.health == overview.HEALTH_LOST:
+                cr.set_line_width(1.2)
+                cr.rectangle(box.x + 0.6, box.y + 0.6, box.w - 1.2,
+                             max(1.0, box.h - 1.2))
+                cr.stroke()
+            else:
+                cr.rectangle(box.x, box.y, box.w, box.h)
+                cr.fill()
+
+            if box.h < 7 and key != self.hover:
+                continue
+            room = (step - box.w - 8) if step and box.x + step < width - 20 \
+                else (width - box.x - box.w - 8)
+            text = node.label
+            if node.present and node.value > 0:
+                text += f"  {self._fmt(node.value)}"
+            cr.select_font_face("Sans", 1 if not node.present else 0,
+                                1 if key == self.hover else 0)
+            cr.set_font_size(10.5)
+            while text and cr.text_extents(text).width > room:
+                text = text[:-2] + "…" if len(text) > 2 else ""
+            if not text:
+                continue
+            cr.set_source_rgba(*fg, (0.5 if not node.present else 0.85)
+                               * (0.4 if dimmed(key) else 1.0))
+            cr.move_to(box.x + box.w + 5, box.y + min(box.h, 14) / 2 + 4)
+            cr.show_text(text)
+
+
 class TrackerWindow(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application, monitor: Monitor, reader: store.Store):
         super().__init__(application=app, title="USB Tracker")
@@ -494,6 +670,7 @@ class TrackerWindow(Gtk.ApplicationWindow):
         self.iters: dict[str, Gtk.TreeIter] = {}
         self.expanded: set[str] = set()
         self.first_fill = True
+        self._refilling = False
         self.set_default_size(1240, 780)
 
         self._build_header()
@@ -594,7 +771,8 @@ class TrackerWindow(Gtk.ApplicationWindow):
         head.append(self.filter_entry)
         self.show_lost = Gtk.ToggleButton(label="Lost", active=True,
                                           tooltip_text="Show devices that are gone")
-        self.show_lost.connect("toggled", lambda *_: self._refill_tree())
+        self.show_lost.connect("toggled", lambda *_: (self._refill_tree(),
+                                                      self._refresh_graph()))
         head.append(self.show_lost)
         box.append(head)
 
@@ -673,6 +851,13 @@ class TrackerWindow(Gtk.ApplicationWindow):
         titles.append(self.device_sub)
         head.append(titles)
 
+        self.overview_button = Gtk.ToggleButton(
+            label="Overview", valign=Gtk.Align.CENTER,
+            tooltip_text="Power or bandwidth flowing from every controller to "
+                         "every device, coloured by health")
+        self.overview_button.connect("toggled", self._on_overview)
+        head.append(self.overview_button)
+
         switcher = Gtk.Box(css_classes=["linked"], valign=Gtk.Align.CENTER)
         self.metric_buttons: dict[str, Gtk.ToggleButton] = {}
         for metric, label in ((METRIC_POWER, "Power"),
@@ -693,7 +878,14 @@ class TrackerWindow(Gtk.ApplicationWindow):
 
         self.graph = HistoryGraph()
         self.graph.on_readout = self._set_readout
-        top.append(self.graph)
+        self.sankey = SankeyView()
+        self.sankey.on_readout = self._overview_readout
+        self._overview_summary = ""
+        self.sankey.on_pick = self._on_sankey_pick
+        self.top_stack = Gtk.Stack(vexpand=True)
+        self.top_stack.add_named(self.graph, "graph")
+        self.top_stack.add_named(self.sankey, "overview")
+        top.append(self.top_stack)
 
         legend = Gtk.Box(spacing=14)
         legend.add_css_class("pane-head")
@@ -709,6 +901,11 @@ class TrackerWindow(Gtk.ApplicationWindow):
         legend.append(self.budget_toggle)
         legend.append(self.subtree_toggle)
         legend.append(self.urb_toggle)
+        self.health_legend = Gtk.Box(spacing=12, visible=False)
+        for health in overview.HEALTH_ORDER[::-1]:
+            self.health_legend.append(
+                self._swatch(HEALTH_COLOURS[health], HEALTH_LABELS[health]))
+        legend.append(self.health_legend)
         self.readout = Gtk.Label(xalign=1.0, hexpand=True, label="")
         self.readout.add_css_class("readout")
         self.readout.add_css_class("dim")
@@ -973,6 +1170,15 @@ class TrackerWindow(Gtk.ApplicationWindow):
         model, sel_iter = selection.get_selected()
         keep = model.get_value(sel_iter, C_KEY) if sel_iter else self.selected_key
 
+        self._refilling = True
+        try:
+            self._fill_tree(keep)
+        finally:
+            self._refilling = False
+
+    def _fill_tree(self, keep: str | None):
+        snap = self.snapshot
+        selection = self.tree.get_selection()
         self.model.clear()
         self.iters.clear()
 
@@ -1183,7 +1389,13 @@ class TrackerWindow(Gtk.ApplicationWindow):
 
     def _on_select(self, selection):
         model, it = selection.get_selected()
-        self.selected_key = model.get_value(it, C_KEY) if it else None
+        key = model.get_value(it, C_KEY) if it else None
+        if (not self._refilling and key and key != self.selected_key
+                and self.overview_button.get_active()):
+            # picking a device means you want its history, not the overview
+            self.selected_key = key
+            self.overview_button.set_active(False)
+        self.selected_key = key
         self._refresh_detail_header()
         self._refresh_graph()
         self._refresh_history()
@@ -1235,14 +1447,64 @@ class TrackerWindow(Gtk.ApplicationWindow):
         if node.over_current:
             bits.append(f"over-current count {node.over_current}")
         self.device_sub.set_label("  ·  ".join(bits))
-        wants_subtree = bool(node.is_hub or node.subtree_ma > node.est_ma)
-        if self.subtree_toggle.get_visible() != wants_subtree:
-            self.subtree_toggle.set_visible(wants_subtree)
+        self._wants_subtree = bool(node.is_hub or node.subtree_ma > node.est_ma)
+        if self.subtree_toggle.get_visible() != self._wants_subtree:
+            self.subtree_toggle.set_visible(self._wants_subtree)
 
     def _window_seconds(self) -> float:
         return RANGES[self.range_drop.get_selected()][1]
 
+    def _on_overview(self, button):
+        active = button.get_active()
+        self.top_stack.set_visible_child_name("overview" if active else "graph")
+        self.range_drop.set_visible(not active)
+        self._sync_legend()
+        self._readout_clear()
+        self._refresh_graph()
+
+    def _readout_clear(self):
+        self.readout.set_label("")
+
+    def _on_sankey_pick(self, key: str):
+        it = self.iters.get(key)
+        self.overview_button.set_active(False)
+        if it is None:
+            return
+        path = self.model.get_path(it)
+        self.tree.expand_to_path(path)
+        self.tree.get_selection().select_path(path)
+        self.tree.scroll_to_cell(path, None, False, 0.0, 0.0)
+
+    def _refresh_overview(self):
+        metric = (overview.METRIC_BANDWIDTH if self.graph.metric == METRIC_BANDWIDTH
+                  else overview.METRIC_POWER)
+        flow = overview.build(self.snapshot, metric,
+                              include_lost=self.show_lost.get_active())
+        self.sankey.set_flow(flow)
+        controllers = len(flow.roots)
+        what = ("reserved bandwidth" if metric == overview.METRIC_BANDWIDTH
+                else "declared power")
+        total = fmt_bps(flow.total) if metric == overview.METRIC_BANDWIDTH \
+            else fmt_ma(flow.total)
+        self.device_label.set_label("USB overview")
+        bits = [f"{total} {what} across {controllers} controller"
+                f"{'' if controllers == 1 else 's'}"]
+        for health in (overview.HEALTH_FAULT, overview.HEALTH_STRAINED,
+                       overview.HEALTH_LOST, overview.HEALTH_SUSPENDED):
+            if flow.counts.get(health):
+                bits.append(f"{flow.counts[health]} {HEALTH_LABELS[health].lower()}")
+        self._overview_summary = "  ·  ".join(bits)
+        if not self.sankey.hover:
+            self.device_sub.set_label(self._overview_summary)
+
+    def _overview_readout(self, text: str):
+        """Hover detail goes in the header line, where there is room for it."""
+        self.device_sub.set_label(text or self._overview_summary)
+
     def _refresh_graph(self):
+        if self.overview_button.get_active():
+            self._refresh_overview()
+            return
         key = self.selected_key
         self._refresh_detail_header()
         if not key:
@@ -1295,11 +1557,19 @@ class TrackerWindow(Gtk.ApplicationWindow):
 
     def _sync_legend(self):
         bandwidth = self.graph.metric == METRIC_BANDWIDTH
+        in_overview = self.overview_button.get_active()
+        self.health_legend.set_visible(in_overview)
+        for widget in (self.primary_swatch, self.budget_toggle):
+            widget.set_visible(not in_overview)
+        self.subtree_toggle.set_visible(
+            not in_overview and getattr(self, "_wants_subtree", False))
+        self.urb_toggle.set_visible(bandwidth and not in_overview)
+        if in_overview:
+            return
         self.primary_swatch.label_widget.set_label(
             "Measured throughput" if bandwidth else "Estimated draw")
         self.budget_toggle.set_label(
             "Reserved bandwidth" if bandwidth else "Declared budget")
-        self.urb_toggle.set_visible(bandwidth)
 
     def _on_series_toggle(self, _btn):
         self._refresh_graph()
