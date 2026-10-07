@@ -46,7 +46,9 @@ class Node:
     manufacturer: str = ""
     version: str = ""
     speed_label: str = ""
+    speed_mbps: float = 0.0
     is_hub: bool = False
+    ports: int = 0               # downstream ports, for a hub that is present
     self_powered: bool = False
     budget_ma: float = 0.0
     est_ma: float = 0.0
@@ -534,7 +536,9 @@ class Monitor:
                 manufacturer=row.manufacturer, version=row.version,
                 speed_label=dev.speed_label if dev else
                             (f"{row.speed_mbps:g} Mb/s" if row.speed_mbps else ""),
+                speed_mbps=dev.speed_mbps if dev else row.speed_mbps,
                 is_hub=dev.is_hub if dev else row.is_hub,
+                ports=dev.max_children if dev else 0,
                 self_powered=dev.self_powered if dev else row.self_powered,
                 budget_ma=float(dev.max_power_ma if dev else row.max_power_ma),
                 est_ma=est.get(key, 0.0),
