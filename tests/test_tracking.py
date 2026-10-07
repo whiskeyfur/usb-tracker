@@ -687,5 +687,90 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(fmt_bps(392192, "compact"), "383k")
 
 
+class ContextMenuTests(unittest.TestCase):
+    """Right-clicking a row must offer that row, including the bottom one.
+
+    The gesture reports widget coordinates and GtkTreeView resolves paths in
+    bin-window ones; left unconverted, the column-header offset pushed every
+    click a row too low and the last row -- where a lost device sorts -- had
+    nothing below it to hit, so no menu appeared at all.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        gi = __import__("gi")
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk
+        if not Gtk.init_check():
+            raise unittest.SkipTest("no display; cannot realise a window")
+        cls.Gtk = Gtk
+
+    def _snapshot(self):
+        """A root hub with two children, one of them gone, so it sorts last."""
+        world = {
+            "usb3": device("usb3", power=0, product="Root hub", dev_class=0x09),
+            "3-1": device("3-1", serial="SN1", product="Stick"),
+            "3-2": device("3-2", serial="SN2", product="Webcam"),
+        }
+        mon = Monitor(db_path=":memory:", interval=1.0, use_kmsg=False,
+                      scan_fn=lambda: dict(world))
+        mon._store = Store(":memory:")
+        mon._rows = {}
+        mon.tick()
+        gone = world.pop("3-2").key
+        snap = mon.tick()
+        self.assertFalse(snap.nodes[gone].present)
+        return mon, snap, gone
+
+    def _pump(self):
+        from gi.repository import GLib
+        ctx = GLib.MainContext.default()
+        for _ in range(500):
+            if not ctx.iteration(False):
+                return
+
+    def test_every_row_including_the_last_offers_its_own_menu(self):
+        from gi.repository import GLib
+        from usbtracker.app import TrackerWindow
+
+        mon, snap, gone = self._snapshot()
+        gtk_app = self.Gtk.Application(application_id="dev.local.usbtracker.test",
+                                       flags=0)
+        seen: dict = {}
+
+        def on_activate(_app):
+            win = TrackerWindow(gtk_app, mon, Store(":memory:"))
+            win.on_snapshot(snap)
+            win.present()
+            self._pump()
+            GLib.timeout_add(500, lambda: (probe(win), False)[1])
+
+        def probe(win):
+            self._pump()
+            column = win.tree.get_column(1)
+            for key, it in win.iters.items():
+                rect = win.tree.get_cell_area(win.model.get_path(it), column)
+                x, y = win.tree.convert_bin_window_to_widget_coords(
+                    rect.x + 4, rect.y + rect.height // 2)
+                popped = win._show_context_menu(float(x), float(y))
+                seen[key] = (popped, win.selected_key,
+                             win.lookup_action("forget-one").get_enabled())
+                win.context_menu.popdown()
+            win.destroy()
+            gtk_app.quit()
+
+        gtk_app.connect("activate", on_activate)
+        gtk_app.run([])
+
+        self.assertTrue(seen, "the tree was never filled")
+        self.assertIn(gone, seen)
+        for key, (popped, selected, _) in seen.items():
+            self.assertTrue(popped, f"no menu for {key}")
+            self.assertEqual(selected, key, f"menu for {key} acted on {selected}")
+        # The lost device sorts last, and only it can be forgotten.
+        self.assertEqual(list(seen)[-1], gone)
+        self.assertTrue(seen[gone][2])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1267,7 +1267,12 @@ class TrackerWindow(Gtk.ApplicationWindow):
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
 
     def _show_context_menu(self, x: float, y: float) -> bool:
-        hit = self.tree.get_path_at_pos(int(x), int(y))
+        # The gesture reports widget coordinates; get_path_at_pos wants them
+        # relative to the rows area, which starts below the column headers.
+        # Without the conversion every click lands a row or so too low, and
+        # the bottom row has nothing below it to hit at all.
+        bx, by = self.tree.convert_widget_to_bin_window_coords(int(x), int(y))
+        hit = self.tree.get_path_at_pos(bx, by)
         if hit is None:
             return False
         path = hit[0]
