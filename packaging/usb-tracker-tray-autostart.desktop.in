@@ -1,0 +1,12 @@
+[Desktop Entry]
+# Starts the panel icon with the desktop session. The session is the only
+# thing that knows the display, so it hands that to systemd and then starts
+# the unit -- which has no [Install] section of its own, on purpose. See
+# usb-tracker-tray.service.in for why.
+Type=Application
+Name=USB Tracker panel icon
+Comment=Starts the USB Tracker panel icon with your desktop session
+Exec=sh -c "systemctl --user import-environment DISPLAY XAUTHORITY && systemctl --user start usb-tracker-tray.service"
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

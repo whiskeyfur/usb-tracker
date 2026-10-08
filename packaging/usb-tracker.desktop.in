@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=USB Tracker
+GenericName=USB monitor
+Comment=Watch USB topology, power budgets, bandwidth, drops and reconnects
+Exec=@PYTHON@ -m usbtracker
+Path=@APPDIR@
+Icon=drive-removable-media-usb
+Terminal=false
+Categories=System;Monitor;
+Keywords=usb;power;bandwidth;hub;disconnect;outage;
+StartupNotify=true

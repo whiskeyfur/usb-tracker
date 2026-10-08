@@ -1,0 +1,38 @@
+# The background recorder: polls sysfs, scrapes the kernel log and writes the
+# history database. No window, no display, no root.
+#
+# This one DOES have an [Install] section, unlike the tray. It is safe to
+# enable against default.target precisely because it needs nothing graphical:
+# where the user manager lingers it starts at boot and keeps recording across
+# logout, login and every session in between, which is the whole point of
+# having it -- an outage that happens twice a day is only caught by something
+# that was already running.
+#
+# Installed by packaging/install-service.sh, which fills the paths in.
+# Control it with: systemctl --user {status,restart,stop,start} usb-tracker
+
+[Unit]
+Description=USB Tracker background recorder
+Documentation=file://@APPDIR@/README.md
+# If it cannot start at all, say so three times and stop rather than loop.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=@APPDIR@
+# Without this, python buffers stdout when it is not a tty and the
+# recorder's own lines never reach the journal -- which makes an empty
+# log look like a unit that started and did nothing.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@PYTHON@ -m usbtracker --daemon --interval @INTERVAL@
+# Plain SIGTERM: --daemon handles it, closes the database and exits 0.
+Restart=on-failure
+RestartSec=5
+# Polling every second forever should never be the reason something else
+# stutters.
+Nice=5
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

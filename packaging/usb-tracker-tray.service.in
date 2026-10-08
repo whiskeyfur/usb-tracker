@@ -1,0 +1,46 @@
+# The panel icon. Reads the database the recorder writes and shows a
+# StatusNotifierItem; it never polls sysfs and never writes.
+#
+# There is deliberately no [Install] section, and you should not enable this.
+# A panel icon needs an X display and a tray to appear in, and neither of the
+# obvious targets delivers that:
+#
+#   graphical-session.target  never becomes active under Cinnamon, so a unit
+#                             wanted by it enables cleanly, reports "enabled",
+#                             and then silently never starts at login.
+#   default.target            is reached at boot where the user manager
+#                             lingers -- long before any session exists -- so
+#                             the icon would start with no display, fail, and
+#                             retry in a loop.
+#
+# Instead the session starts it, through the autostart entry in
+# packaging/usb-tracker-tray-autostart.desktop.in, which hands systemd the
+# display first. So: start it from the session, never from a target.
+#
+# Installed by packaging/install-service.sh, which fills the paths in.
+# Control it with: systemctl --user {status,restart,stop,start} usb-tracker-tray
+
+[Unit]
+Description=USB Tracker panel icon
+Documentation=file://@APPDIR@/README.md
+# Correct wherever graphical-session.target does work, and harmless here,
+# where it never activates: the icon goes away with the session.
+PartOf=graphical-session.target
+After=graphical-session.target
+# The icon is a view of the recorder, so bring the recorder up with it.
+Wants=usb-tracker.service
+After=usb-tracker.service
+# With no display, or no tray to register with, restarting will not help.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=@APPDIR@
+# systemctl, for the recorder's state and the restart item in the menu.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@PYTHON@ -m usbtracker --tray --unit usb-tracker.service
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10

@@ -350,6 +350,11 @@ class Store:
             (key, since, since, bucket))
         return [tuple(r) for r in cur.fetchall()]
 
+    def last_sample_ts(self) -> float | None:
+        """When the recorder last wrote anything, for spotting a dead one."""
+        row = self.db.execute("SELECT MAX(ts) t FROM samples").fetchone()
+        return row["t"] if row and row["t"] is not None else None
+
     def first_sample_ts(self, key: str) -> float | None:
         row = self.db.execute("SELECT MIN(ts) t FROM samples WHERE key=?",
                               (key,)).fetchone()
