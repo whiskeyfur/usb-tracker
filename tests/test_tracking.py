@@ -16,6 +16,7 @@ from usbtracker.allocation import hub_allocation          # noqa: E402
 from usbtracker.app import fmt_bps, fmt_ma, nice_ceiling  # noqa: E402
 from usbtracker.monitor import Monitor                   # noqa: E402
 from usbtracker.store import Store                       # noqa: E402
+from usbtracker.summary import ago, summarise            # noqa: E402
 from usbtracker.sysfs import Endpoint, Interface, UsbDevice   # noqa: E402
 
 
@@ -770,6 +771,108 @@ class ContextMenuTests(unittest.TestCase):
         # The lost device sorts last, and only it can be forgotten.
         self.assertEqual(list(seen)[-1], gone)
         self.assertTrue(seen[gone][2])
+
+
+class SummaryTests(unittest.TestCase):
+    """What the panel icon reports, which is a read of the recorder's output.
+
+    The icon must never present the database's `present` flags as current
+    when nothing is recording: they are only ever as fresh as the last poll.
+    """
+
+    def setUp(self):
+        self.db = Store(":memory:")
+        self.now = time.time()
+        for key, product, present in (("live", "Stick", True),
+                                      ("gone", "Webcam", False)):
+            self.db.upsert_device(
+                key=key, busid="3-1", parent_key=None, vid="a", pid=key,
+                serial=key, product=product, manufacturer="m",
+                class_hint="HID", speed_mbps=480, max_power_ma=100,
+                version="2.00", is_hub=False, self_powered=False,
+                ts=self.now, present=present)
+        self.db.commit()
+
+    def view(self, interval=1.0):
+        return summarise(self.db, self.now, interval)
+
+    def test_last_sample_ts_is_the_newest_write(self):
+        self.assertIsNone(self.db.last_sample_ts())
+        self.db.add_sample(self.now - 50, "live", 1, 2, 3, "active", 0)
+        self.db.add_sample(self.now - 5, "live", 1, 2, 3, "active", 0)
+        self.db.commit()
+        self.assertAlmostEqual(self.db.last_sample_ts(), self.now - 5)
+
+    def test_a_live_recorder_gives_the_counts(self):
+        self.db.add_sample(self.now, "live", 1, 2, 3, "active", 0)
+        self.db.commit()
+        view = self.view()
+        self.assertFalse(view.stale)
+        self.assertEqual(view.counts, "1 connected · 1 gone")
+        self.assertEqual((view.live, view.gone), (1, 1))
+
+    def test_a_stale_recorder_is_reported_not_counted(self):
+        self.db.add_sample(self.now - 3600, "live", 1, 2, 3, "active", 0)
+        self.db.commit()
+        view = self.view()
+        self.assertTrue(view.stale)
+        self.assertIn("not recording", view.counts)
+        self.assertNotIn("connected", view.counts)
+        self.assertTrue(view.alert)       # worth noticing, not worth hiding
+
+    def test_a_database_with_no_samples_is_stale_not_a_crash(self):
+        view = self.view()
+        self.assertTrue(view.stale)
+        self.assertIn("never", view.counts)
+
+    def test_staleness_scales_with_the_interval_but_has_a_floor(self):
+        # At 0.5s polling, 6 x interval is 3s -- too tight to call a recorder
+        # dead over -- so the 20s floor decides instead.
+        self.db.add_sample(self.now - 10, "live", 1, 2, 3, "active", 0)
+        self.db.commit()
+        self.assertFalse(self.view(interval=0.5).stale)
+        self.db.add_sample(self.now - 25, "live", 1, 2, 3, "active", 0)
+        self.db.commit()
+        self.assertTrue(summarise(self.db, self.now + 25, 0.5).stale)
+
+        # A deliberately slow poller is allowed to be quiet for longer: at 10s
+        # the interval governs, so 30s of silence is still alive.
+        self.assertFalse(summarise(self.db, self.now + 5, 10.0).stale)
+        self.assertTrue(summarise(self.db, self.now + 90, 10.0).stale)
+
+    def test_a_recovery_is_not_counted_as_a_second_outage(self):
+        self.db.add_sample(self.now, "live", 1, 2, 3, "active", 0)
+        self.db.add_event(self.now - 60, "", store.KIND_OUTAGE,
+                          "4 devices went away with the hub at 3-4")
+        self.db.add_event(self.now - 59, "", store.KIND_OUTAGE,
+                          "all 4 back after 3s")
+        self.db.commit()
+        view = self.view()
+        self.assertEqual(view.outage, "1 outage in 24 h")
+        self.assertEqual(len(view.outages), 1)
+        self.assertIn("hub at 3-4", view.outages[0][1])
+        self.assertTrue(view.alert)       # a minute ago is still news
+
+    def test_an_old_outage_stops_raising_the_alarm(self):
+        self.db.add_sample(self.now, "live", 1, 2, 3, "active", 0)
+        self.db.add_event(self.now - 7200, "", store.KIND_OUTAGE,
+                          "4 devices went away with the hub at 3-4")
+        self.db.commit()
+        view = self.view()
+        self.assertEqual(view.outage, "1 outage in 24 h")
+        self.assertFalse(view.alert)
+
+    def test_outages_older_than_a_day_drop_off(self):
+        self.db.add_sample(self.now, "live", 1, 2, 3, "active", 0)
+        self.db.add_event(self.now - 90000, "", store.KIND_OUTAGE, "yesterday")
+        self.db.commit()
+        self.assertEqual(self.view().outage, "no outages in 24 h")
+
+    def test_relative_times_read_naturally(self):
+        self.assertEqual(ago(30), "30s ago")
+        self.assertEqual(ago(600), "10 min ago")
+        self.assertEqual(ago(7200), "2h ago")
+        self.assertEqual(ago(259200), "3 days ago")
 
 
 if __name__ == "__main__":

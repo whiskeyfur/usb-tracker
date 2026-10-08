@@ -40,6 +40,7 @@ or `python3 -m usbtracker`. Other modes:
 ```bash
 python3 -m usbtracker --analyze         # diagnose from this boot's kernel log
 python3 -m usbtracker --daemon          # record in a terminal, no window
+python3 -m usbtracker --tray            # just the panel icon
 python3 -m usbtracker --outages         # print recorded multi-device outages
 python3 -m usbtracker --list            # print the tree once and exit
 python3 -m usbtracker --events          # print the recorded event log
@@ -50,8 +51,14 @@ Useful options: `--interval SECONDS` (default 2), `--db PATH`,
 
 History lives in `~/.local/share/usb-tracker/history.db` and survives
 restarts, so the app knows about a device you unplugged last week. The daemon
-and the window can share one database; run the daemon from a systemd user
-service if you want a continuous record.
+and the window can share one database. For a continuous record and a panel
+icon, install both as user services:
+
+```bash
+./packaging/install-service.sh
+```
+
+See [Running it as a service](#running-it-as-a-service).
 
 ### Requirements
 
@@ -61,7 +68,13 @@ Python 3.10+, PyGObject and GTK 4. On Debian/Ubuntu:
 sudo apt install python3-gi gir1.2-gtk-4.0
 ```
 
-The headless modes (`--list`, `--events`, `--daemon`) need neither.
+The headless modes (`--list`, `--events`, `--daemon`) need neither. The panel
+icon needs GTK 3 and AyatanaAppIndicator3 as well, because that is what a
+system tray is on Linux and it has no GTK 4 equivalent:
+
+```bash
+sudo apt install gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1
+```
 
 ![bandwidth view](docs/bandwidth.png)
 
@@ -120,10 +133,70 @@ downstream draw is shown alongside it.
 
 ### Catching the next one
 
-An intermittent fault needs something always running. `packaging/` has a
-systemd user service that records continuously; see
-[packaging/README.md](packaging/README.md). The window reads the same
-database, so its history shows up there too.
+An intermittent fault needs something always running. The installer below
+sets that up; the window reads the same database, so its history shows up
+there too.
+
+## Running it as a service
+
+```bash
+./packaging/install-service.sh              # install and start
+./packaging/install-service.sh --uninstall  # remove again
+```
+
+Per-user, no root: two units in `~/.config/systemd/user`, an autostart entry,
+and a launcher. Your recorded history is left alone by the uninstall.
+
+| Unit | What it is |
+| --- | --- |
+| `usb-tracker.service` | The recorder. Headless, polls every second, enabled, so it runs from boot and keeps recording across logins. |
+| `usb-tracker-tray.service` | The panel icon. Needs a display, so the session starts it — see below. |
+
+Check on them with `systemctl --user status usb-tracker` and
+`journalctl --user -u usb-tracker -f`.
+
+### The panel icon
+
+A StatusNotifierItem in the system tray, showing what the recorder has seen:
+how many devices are connected, how many are remembered but gone, and how
+many correlated outages have happened in the last 24 hours, with the most
+recent ones in a submenu. It turns into a warning icon when an outage has
+just happened — or when the recorder has stopped, since a stale device count
+is worse than none.
+
+**Its first menu item opens the window.** Under StatusNotifier there is no
+plain "icon clicked" event — clicking opens the menu — so the primary action
+has to be a menu item. Middle-click also opens the window.
+
+The icon is a separate process from the window on purpose. The only tray
+library available is AyatanaAppIndicator3, which is GTK 3, and one process
+cannot load GTK 3 and GTK 4 at once. So the icon is GTK 3, reads the database
+read-only, never polls sysfs itself, and launches the GTK 4 window as its own
+program.
+
+### Why the icon is not `systemctl --user enable`d
+
+Neither of the obvious targets works for something that needs a display:
+
+- `graphical-session.target` is never activated by some desktops, Cinnamon
+  among them. A unit wanted by it enables cleanly, reports `enabled`, and
+  then silently never starts at login.
+- `default.target` is reached at boot wherever the user manager lingers,
+  long before any session exists, so the icon would start with no display,
+  fail, and retry in a loop.
+
+So `usb-tracker-tray.service` has no `[Install]` section at all, and an
+autostart entry in `~/.config/autostart` starts it from inside the session,
+after handing systemd the display:
+
+```
+systemctl --user import-environment DISPLAY XAUTHORITY
+systemctl --user start usb-tracker-tray.service
+```
+
+The recorder has the opposite needs — it is headless, wants to run from boot
+and to survive logout — so it *is* enabled, against `default.target`. The two
+units differ because what they need from the session differs.
 
 ## How power is measured — read this before trusting a number
 
@@ -333,8 +406,12 @@ usbtracker/
   store.py     SQLite: device roster, event log, power samples
   power.py     reads and changes power/control, via polkit when needed
   app.py       GTK 4 window: tree, Cairo graph, history, context menu
+  summary.py   what a glanceable view of the recorder's output says;
+               no toolkit, so it is testable and reusable
+  tray.py      GTK 3 panel icon, a separate process from the window
   __main__.py  CLI entry point
-packaging/     privileged helper, its polkit action, and an installer
+packaging/     the service units and their installer, plus the privileged
+               power helper and its polkit action
 tests/         unit tests, with the sysfs scan injected
 ```
 

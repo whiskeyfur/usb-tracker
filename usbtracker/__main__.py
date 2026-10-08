@@ -23,6 +23,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="discard samples older than this (default: 7)")
     parser.add_argument("--no-kmsg", action="store_true",
                         help="skip kernel-log scraping for resets and faults")
+    parser.add_argument("--unit", default="usb-tracker.service",
+                        help="recorder service the panel icon reports on "
+                             "(default: usb-tracker.service)")
+    parser.add_argument("--tray-label", action="store_true",
+                        help="show the connected count beside the panel icon")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--daemon", action="store_true",
                       help="record in the terminal, no window")
@@ -32,6 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="print the recorded event log and exit")
     mode.add_argument("--outages", action="store_true",
                       help="print recorded multi-device outages and exit")
+    mode.add_argument("--tray", action="store_true",
+                      help="run only the panel icon, reading what the "
+                           "recorder writes")
     mode.add_argument("--analyze", action="store_true",
                       help="group this boot's kernel log into outages and say "
                            "what they have in common")
@@ -172,6 +180,18 @@ def cmd_daemon(args) -> int:
     return 0
 
 
+def cmd_tray(args) -> int:
+    try:
+        from .tray import run as run_tray
+    except Exception as exc:                      # no GTK 3 or no indicator
+        print(f"Cannot start the panel icon: {exc}\n"
+              "It needs GTK 3 and AyatanaAppIndicator3 (Debian/Ubuntu: "
+              "apt install gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1).",
+              file=sys.stderr)
+        return 1
+    return run_tray(args.db, args.interval, args.unit, args.tray_label)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.list:
@@ -184,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_analyze(args)
     if args.daemon:
         return cmd_daemon(args)
+    if args.tray:
+        return cmd_tray(args)
     try:
         from .app import run
     except Exception as exc:                      # missing PyGObject or no display
